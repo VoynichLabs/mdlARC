@@ -34,6 +34,12 @@ def parse_args() -> argparse.Namespace:
         "--data-path", type=Path, default=None, help="Path to the challenges.json file."
     )
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--eval-batch-size",
+        type=int,
+        default=None,
+        help="Batch size for batched evaluation decoding (defaults to --batch-size).",
+    )
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
@@ -211,6 +217,97 @@ def _update_position_state(
 
 
 @torch.no_grad()
+def greedy_generate_batch(
+    model: TinyTransformer,
+    prompt_tokens_batch: Tuple[torch.LongTensor, ...],
+    example_ids: Tuple[int, ...],
+    device: torch.device,
+    max_new_tokens: int,
+) -> Tuple[torch.LongTensor, ...]:
+    """Greedy batched generation over multiple prompt sequences.
+
+    This implementation decodes several sequences in parallel by repeatedly
+    running the full model forward pass on the current batch of prefixes.
+    It does not use the KV cache, but increases total tokens/sec by
+    processing multiple sequences per step.
+    """
+    model.eval()
+    if not prompt_tokens_batch:
+        return tuple()
+
+    batch_size = len(prompt_tokens_batch)
+    if batch_size != len(example_ids):
+        raise ValueError(
+            f"prompt_tokens_batch has {batch_size} elements but "
+            f"example_ids has {len(example_ids)} entries."
+        )
+
+    # Initialize per-sequence token lists from the provided prompts.
+    generated: list[list[int]] = []
+    for tokens in prompt_tokens_batch:
+        seq = [int(t) for t in tokens.tolist()]
+        generated.append(seq)
+
+    finished = [False] * batch_size
+    example_ids_tensor = torch.tensor(example_ids, dtype=torch.long, device=device)
+
+    for _ in range(max_new_tokens):
+        if all(finished):
+            break
+
+        lengths = [len(seq) for seq in generated]
+        max_len = max(lengths)
+
+        input_ids = torch.full(
+            (batch_size, max_len),
+            END_TOKEN_ID,
+            dtype=torch.long,
+            device=device,
+        )
+        attention_mask = torch.zeros(
+            (batch_size, max_len), dtype=torch.bool, device=device
+        )
+
+        for i, seq in enumerate(generated):
+            seq_len = len(seq)
+            if seq_len == 0:
+                continue
+            input_ids[i, :seq_len] = torch.tensor(
+                seq, dtype=torch.long, device=device
+            )
+            attention_mask[i, :seq_len] = True
+
+        outputs = model(
+            input_ids=input_ids,
+            example_ids=example_ids_tensor,
+            attention_mask=attention_mask,
+        )
+        logits = outputs["logits"]  # [B, max_len, vocab]
+
+        for i in range(batch_size):
+            if finished[i]:
+                continue
+            seq_len = lengths[i]
+            if seq_len == 0:
+                continue
+            next_token_logits = logits[i, seq_len - 1, :]
+            next_token_id = int(torch.argmax(next_token_logits).item())
+            generated[i].append(next_token_id)
+
+            if next_token_id == END_TOKEN_ID:
+                finished[i] = True
+            elif len(generated[i]) >= model.config.max_seq_len:
+                print(
+                    "Reached model max_seq_len during generation for one sequence; stopping it."
+                )
+                finished[i] = True
+
+    return tuple(
+        torch.tensor(seq, dtype=torch.long).cpu() for seq in generated
+    )
+
+
+@torch.no_grad()
 def greedy_generate(
     model: TinyTransformer,
     prompt_tokens: torch.LongTensor,
@@ -333,6 +430,7 @@ def evaluate_dataset(
     max_new_tokens: int,
     log_eval_strings: bool = False,
     log_eval_limit: int = 0,
+    batch_size: int = 8,
 ) -> None:
     """Run greedy inference over all test pairs and compute exact-match accuracy.
 
@@ -355,50 +453,78 @@ def evaluate_dataset(
     correct = 0
     logged = 0
 
-    # Evaluate only on test pairs without provided outputs (i.e., challenge test pairs)
+    # Collect evaluable test examples first (those with matching solutions).
+    eval_examples = []
     for example in dataset.iter_examples(split="test", has_output=False):
-        # Guard against missing solutions
         sols = solutions.get(example.task_id)
         if not sols:
             continue
         if example.pair_index >= len(sols):
             continue
+        eval_examples.append(example)
 
-        # Prepare prompt and generate
-        # Optional: print prompt before generation
+    if not eval_examples:
+        print("No evaluable test pairs found; skipping eval.")
+        return
+
+    batch_size = max(1, int(batch_size))
+
+    # Process in batches for parallel decoding.
+    for start in range(0, len(eval_examples), batch_size):
+        batch = eval_examples[start : start + batch_size]
+
+        # Optional prompt logging before generation.
         if log_eval_strings and logged < log_eval_limit:
-            print("\n[eval prompt]",
-                  f"task={example.task_id}",
-                  f"pair={example.pair_index}")
-            print("str:", tokens_to_string(example.tokens.tolist()))
+            for example in batch:
+                if logged >= log_eval_limit:
+                    break
+                print(
+                    "\n[eval prompt]",
+                    f"task={example.task_id}",
+                    f"pair={example.pair_index}",
+                )
+                print("str:", tokens_to_string(example.tokens.tolist()))
+                logged += 1
 
-        generated = greedy_generate(
+        prompt_tokens_batch = tuple(example.tokens for example in batch)
+        example_ids_batch = tuple(example.example_id for example in batch)
+        generated_batch = greedy_generate_batch(
             model=model,
-            prompt_tokens=example.tokens,
-            example_id=example.example_id,
+            prompt_tokens_batch=prompt_tokens_batch,
+            example_ids=example_ids_batch,
             device=device,
             max_new_tokens=max_new_tokens,
         )
-        full_sequence = generated.tolist()
-        output_tokens = extract_output_tokens(full_sequence)
-        predicted_grid = tokens_to_grid(output_tokens)
-        reference_grid = sols[example.pair_index]
 
-        # Optional: print generated sequence
-        if log_eval_strings and logged < log_eval_limit:
-            print("[eval generated raw]",
-                  f"task={example.task_id}",
-                  f"pair={example.pair_index}")
-            print("str:", tokens_to_string(full_sequence))
-            print("[eval generated]",
-                  f"task={example.task_id}",
-                  f"pair={example.pair_index}")
-            print("str:", tokens_to_string(output_tokens))
-            logged += 1
+        for example, generated in zip(batch, generated_batch):
+            sols = solutions.get(example.task_id)
+            if not sols or example.pair_index >= len(sols):
+                continue
 
-        is_match = predicted_grid == reference_grid
-        total += 1
-        correct += int(is_match)
+            full_sequence = generated.tolist()
+            output_tokens = extract_output_tokens(full_sequence)
+            predicted_grid = tokens_to_grid(output_tokens)
+            reference_grid = sols[example.pair_index]
+
+            # Optional: print generated sequence
+            if log_eval_strings and logged < log_eval_limit:
+                print(
+                    "[eval generated raw]",
+                    f"task={example.task_id}",
+                    f"pair={example.pair_index}",
+                )
+                print("str:", tokens_to_string(full_sequence))
+                print(
+                    "[eval generated]",
+                    f"task={example.task_id}",
+                    f"pair={example.pair_index}",
+                )
+                print("str:", tokens_to_string(output_tokens))
+                logged += 1
+
+            is_match = predicted_grid == reference_grid
+            total += 1
+            correct += int(is_match)
 
     if total == 0:
         print("No evaluable test pairs found; skipping eval.")
@@ -541,6 +667,7 @@ def run(args: argparse.Namespace) -> None:
                 break
         maybe_save_model(model, dataset, data_path, args.save_path)
         # Auto-evaluate on test pairs from the same dataset (using solutions.json)
+        eval_batch_size = args.eval_batch_size or args.batch_size
         evaluate_dataset(
             model=model,
             dataset=dataset,
@@ -549,6 +676,7 @@ def run(args: argparse.Namespace) -> None:
             max_new_tokens=args.max_new_tokens,
             log_eval_strings=args.log_eval_strings,
             log_eval_limit=args.log_eval_limit,
+            batch_size=eval_batch_size,
         )
     else:
         # Eval-only mode: if a specific task is provided, run single-example inference.
@@ -565,6 +693,7 @@ def run(args: argparse.Namespace) -> None:
                 plot_grids_flag=args.plot_inference_grids,
             )
         else:
+            eval_batch_size = args.eval_batch_size or args.batch_size
             evaluate_dataset(
                 model=model,
                 dataset=dataset,
@@ -573,6 +702,7 @@ def run(args: argparse.Namespace) -> None:
                 max_new_tokens=args.max_new_tokens,
                 log_eval_strings=args.log_eval_strings,
                 log_eval_limit=args.log_eval_limit,
+                batch_size=eval_batch_size,
             )
 
 
