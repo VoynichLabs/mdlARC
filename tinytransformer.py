@@ -89,12 +89,18 @@ class MultiHeadSelfAttention(nn.Module):
         self,
         hidden_states: torch.Tensor,
         pos_xyz: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        causal_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Self-attention variant that maintains a KV cache.
+        """Self-attention variant that also exposes a KV cache.
 
-        Used for autoregressive generation to avoid recomputing keys/values
-        for the prefix tokens.
+        When `past_key_value` is None, this reduces to the normal attention
+        computation (including causal and padding masks) while returning
+        the per-layer keys/values for caching. When `past_key_value` is
+        provided, `hidden_states` and `pos_xyz` should contain only the
+        newly generated tokens and no masking is applied, since there are
+        no future positions during autoregressive decoding.
         """
         batch_size, seq_len, dim = hidden_states.shape
 
@@ -103,14 +109,42 @@ class MultiHeadSelfAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)
         queries, keys, values = qkv.unbind(0)
 
-        queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz)
+        if pos_xyz is not None:
+            queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz)
 
+        # Incremental decoding branch: concatenate cached K/V and attend
+        # from the new tokens only. No causal mask is needed because there
+        # are no future positions beyond the newly appended tokens.
         if past_key_value is not None:
             past_keys, past_values = past_key_value
             keys = torch.cat([past_keys, keys], dim=2)
             values = torch.cat([past_values, values], dim=2)
 
+            attn_scores = torch.matmul(queries, keys.transpose(-2, -1)) * self.scale
+            attn_weights = F.softmax(attn_scores, dim=-1)
+            attn_weights = self.dropout(attn_weights)
+            attn_output = torch.matmul(attn_weights, values)
+            attn_output = (
+                attn_output.transpose(1, 2)
+                .contiguous()
+                .view(batch_size, seq_len, dim)
+            )
+            attn_output = self.out_proj(attn_output)
+            present_key_value = (keys, values)
+            return attn_output, present_key_value
+
+        # Full-sequence branch used for the initial prompt: this mirrors
+        # the standard attention forward (including causal and padding
+        # masks) while also returning K/V for caching.
         attn_scores = torch.matmul(queries, keys.transpose(-2, -1)) * self.scale
+
+        if causal_mask is not None:
+            attn_scores = attn_scores.masked_fill(causal_mask, float("-inf"))
+
+        if attention_mask is not None:
+            key_mask = ~attention_mask[:, None, None, :]
+            attn_scores = attn_scores.masked_fill(key_mask, float("-inf"))
+
         attn_weights = F.softmax(attn_scores, dim=-1)
         attn_weights = self.dropout(attn_weights)
         attn_output = torch.matmul(attn_weights, values)
@@ -170,17 +204,26 @@ class TransformerBlock(nn.Module):
         self,
         hidden_states: torch.Tensor,
         pos_xyz: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        causal_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         attn_input = self.ln_1(hidden_states)
         attn_output, present_key_value = self.attention.forward_with_cache(
-            attn_input, pos_xyz=pos_xyz, past_key_value=past_key_value
+            attn_input,
+            pos_xyz=pos_xyz,
+            attention_mask=attention_mask,
+            causal_mask=causal_mask,
+            past_key_value=past_key_value,
         )
         hidden_states = hidden_states + attn_output
 
         ff_input = self.ln_2(hidden_states)
         ff_output = self.ff(ff_input)
         hidden_states = hidden_states + ff_output
+
+        if attention_mask is not None:
+            hidden_states = hidden_states * attention_mask.unsqueeze(-1)
         return hidden_states, present_key_value
 
 
@@ -301,17 +344,23 @@ class TinyTransformer(nn.Module):
         hidden_states = token_embeds + start_mask * example_embeds.unsqueeze(1)
         hidden_states = self.dropout(hidden_states)
 
-        # Initial prompt: no cache yet, compute 3D positions internally.
+        # Initial prompt: no cache yet, compute 3D positions and use the
+        # exact same masking behavior as the standard forward pass.
         if past_key_values is None:
             attention_mask = torch.ones_like(
                 input_ids, dtype=torch.bool, device=device
             )
             pos_xyz = self._compute_positions_3d(input_ids, attention_mask)
+            causal_mask = self._build_causal_mask(seq_len, device)
 
             past_key_values_out: List[Tuple[torch.Tensor, torch.Tensor]] = []
             for block in self.blocks:
                 hidden_states, present_kv = block.forward_with_cache(
-                    hidden_states, pos_xyz, past_key_value=None
+                    hidden_states,
+                    pos_xyz,
+                    attention_mask=attention_mask,
+                    causal_mask=causal_mask,
+                    past_key_value=None,
                 )
                 past_key_values_out.append(present_kv)
 
