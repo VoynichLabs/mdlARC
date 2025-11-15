@@ -455,7 +455,20 @@ def infer_num_examples_from_checkpoint(
     return None
 
 
-def run(args: argparse.Namespace) -> None:
+def build_model_and_data(
+    args: argparse.Namespace,
+) -> Tuple[
+    TinyTransformer,
+    ARCExampleDataset,
+    torch.utils.data.DataLoader,
+    torch.device,
+    Path,
+]:
+    """Construct dataset, dataloader, and model for a given arg namespace.
+
+    Shared by CLI entrypoints and notebooks so that training, evaluation,
+    and inference can be orchestrated independently.
+    """
     set_seed(args.seed)
     device = resolve_device(args.device)
     checkpoint = load_checkpoint(args.checkpoint_path)
@@ -519,36 +532,78 @@ def run(args: argparse.Namespace) -> None:
         state_dict = checkpoint["model_state"]
         model.load_state_dict(state_dict, strict=False)
 
-    if not args.eval_only:
-        optimizer = AdamW(
-            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+    return model, dataset, dataloader, device, data_path
+
+
+def train_model(
+    args: argparse.Namespace,
+    model: TinyTransformer,
+    dataloader: torch.utils.data.DataLoader,
+    dataset: ARCExampleDataset,
+    device: torch.device,
+    data_path: Path,
+) -> None:
+    """Run the training loop only (no evaluation)."""
+    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    step = 0
+    for epoch in range(args.epochs):
+        print(f"Epoch {epoch + 1}/{args.epochs}")
+        step = train_one_epoch(
+            model=model,
+            dataloader=dataloader,
+            optimizer=optimizer,
+            device=device,
+            grad_clip=args.grad_clip,
+            max_steps=args.max_steps,
+            start_step=step,
+            log_train_strings=args.log_train_strings,
+            log_train_limit=args.log_train_limit,
         )
-        step = 0
-        for epoch in range(args.epochs):
-            print(f"Epoch {epoch + 1}/{args.epochs}")
-            step = train_one_epoch(
-                model=model,
-                dataloader=dataloader,
-                optimizer=optimizer,
-                device=device,
-                grad_clip=args.grad_clip,
-                max_steps=args.max_steps,
-                start_step=step,
-                log_train_strings=args.log_train_strings,
-                log_train_limit=args.log_train_limit,
-            )
-            if args.max_steps and step >= args.max_steps:
-                break
-        maybe_save_model(model, dataset, data_path, args.save_path)
-        # Auto-evaluate on test pairs from the same dataset (using solutions.json)
-        evaluate_dataset(
+        if args.max_steps and step >= args.max_steps:
+            break
+    maybe_save_model(model, dataset, data_path, args.save_path)
+
+
+def evaluate_model(
+    args: argparse.Namespace,
+    model: TinyTransformer,
+    dataset: ARCExampleDataset,
+    device: torch.device,
+    data_path: Path,
+) -> None:
+    """Evaluate a model on the ARC test split using solutions.json."""
+    evaluate_dataset(
+        model=model,
+        dataset=dataset,
+        data_path=data_path,
+        device=device,
+        max_new_tokens=args.max_new_tokens,
+        log_eval_strings=args.log_eval_strings,
+        log_eval_limit=args.log_eval_limit,
+    )
+
+
+def run(args: argparse.Namespace) -> None:
+    model, dataset, dataloader, device, data_path = build_model_and_data(args)
+
+    if not args.eval_only:
+        # Train then auto-evaluate on test pairs from the same dataset
+        # (using solutions.json). This mirrors the original behavior but
+        # now delegates to dedicated train / eval helpers.
+        train_model(
+            args=args,
+            model=model,
+            dataloader=dataloader,
+            dataset=dataset,
+            device=device,
+            data_path=data_path,
+        )
+        evaluate_model(
+            args=args,
             model=model,
             dataset=dataset,
-            data_path=data_path,
             device=device,
-            max_new_tokens=args.max_new_tokens,
-            log_eval_strings=args.log_eval_strings,
-            log_eval_limit=args.log_eval_limit,
+            data_path=data_path,
         )
     else:
         # Eval-only mode: if a specific task is provided, run single-example inference.
