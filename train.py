@@ -181,6 +181,36 @@ def train_one_epoch(
     return step
 
 
+def _build_weight_decay_param_groups(
+    model: nn.Module, weight_decay: float
+) -> Any:
+    """Split parameters so only non-attention Linear weights use weight decay."""
+    decay_params = []
+    no_decay_params = []
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if name.endswith(".bias"):
+            no_decay_params.append(param)
+            continue
+
+        module_name = name.rsplit(".", 1)[0] if "." in name else ""
+        module = model.get_submodule(module_name) if module_name else model
+
+        if isinstance(module, nn.Linear) and "attention" not in module_name:
+            decay_params.append(param)
+        else:
+            no_decay_params.append(param)
+
+    param_groups = []
+    if decay_params:
+        param_groups.append({"params": decay_params, "weight_decay": weight_decay})
+    if no_decay_params:
+        param_groups.append({"params": no_decay_params, "weight_decay": 0.0})
+    return param_groups
+
+
 def _update_position_state(
     x: int, y: int, z: int, token_id: int, is_first: bool
 ) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
@@ -544,7 +574,8 @@ def train_model(
     data_path: Path,
 ) -> None:
     """Run the training loop only (no evaluation)."""
-    optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    param_groups = _build_weight_decay_param_groups(model, args.weight_decay)
+    optimizer = AdamW(param_groups, lr=args.lr)
     step = 0
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
