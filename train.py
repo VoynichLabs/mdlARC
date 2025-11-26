@@ -466,6 +466,8 @@ def maybe_save_model(
     dataset: ARCExampleDataset,
     data_path: Path,
     save_path: Optional[Path],
+    optimizer: Optional[torch.optim.Optimizer] = None,
+    global_step: Optional[int] = None,
 ) -> None:
     if save_path is None:
         return
@@ -476,6 +478,10 @@ def maybe_save_model(
         "task_ids": list(dataset.task_ids),
         "data_path": str(data_path),
     }
+    if optimizer is not None:
+        checkpoint["optimizer_state"] = optimizer.state_dict()
+    if global_step is not None:
+        checkpoint["global_step"] = int(global_step)
     torch.save(checkpoint, save_path)
     print(f"Saved checkpoint to {save_path}")
 
@@ -510,6 +516,7 @@ def infer_num_examples_from_checkpoint(
 
 def build_model_and_data(
     args: argparse.Namespace,
+    checkpoint: Optional[Dict[str, Any]] = None,
 ) -> Tuple[
     TinyTransformer, ARCExampleDataset, torch.utils.data.DataLoader, torch.device, Path
 ]:
@@ -520,7 +527,7 @@ def build_model_and_data(
     """
     set_seed(args.seed)
     device = resolve_device(args.device)
-    checkpoint = load_checkpoint(args.checkpoint_path)
+    checkpoint = checkpoint if checkpoint is not None else load_checkpoint(args.checkpoint_path)
 
     data_path = args.data_path
     if data_path is None:
@@ -580,6 +587,8 @@ def build_model_and_data(
     if checkpoint:
         state_dict = checkpoint["model_state"]
         model.load_state_dict(state_dict, strict=False)
+    # Stash checkpoint for downstream consumers (e.g., optimizer restore).
+    model._loaded_checkpoint = checkpoint
 
     return model, dataset, dataloader, device, data_path
 
@@ -591,11 +600,34 @@ def train_model(
     dataset: ARCExampleDataset,
     device: torch.device,
     data_path: Path,
+    checkpoint: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Run the training loop only (no evaluation)."""
+    if checkpoint is None:
+        checkpoint = getattr(model, "_loaded_checkpoint", None)
+
     param_groups = _build_weight_decay_param_groups(model, args.weight_decay)
     optimizer = AdamW(param_groups, lr=args.lr)
-    step = 0
+    step = int(checkpoint.get("global_step", 0)) if checkpoint else 0
+
+    if checkpoint and step > 0:
+        print(f"Resuming training from global_step={step}.")
+
+    # Restore optimizer state if available so momentum/adam moments resume.
+    if checkpoint and "optimizer_state" in checkpoint:
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+        print("Restored optimizer state from checkpoint.")
+
+    if args.max_steps and step >= args.max_steps:
+        print(
+            f"Global step {step} >= max_steps ({args.max_steps}); skipping training loop."
+        )
+        return
+
     model = torch.compile(model)
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
@@ -612,7 +644,14 @@ def train_model(
         )
         if args.max_steps and step >= args.max_steps:
             break
-    maybe_save_model(model, dataset, data_path, args.save_path)
+    maybe_save_model(
+        model,
+        dataset,
+        data_path,
+        args.save_path,
+        optimizer=optimizer,
+        global_step=step,
+    )
 
 
 def evaluate_model(
@@ -635,7 +674,10 @@ def evaluate_model(
 
 
 def run(args: argparse.Namespace) -> None:
-    model, dataset, dataloader, device, data_path = build_model_and_data(args)
+    checkpoint = load_checkpoint(args.checkpoint_path)
+    model, dataset, dataloader, device, data_path = build_model_and_data(
+        args, checkpoint=checkpoint
+    )
 
     if not args.eval_only:
         # Train then auto-evaluate on test pairs from the same dataset
@@ -648,6 +690,7 @@ def run(args: argparse.Namespace) -> None:
             dataset=dataset,
             device=device,
             data_path=data_path,
+            checkpoint=checkpoint,
         )
         evaluate_model(
             args=args, model=model, dataset=dataset, device=device, data_path=data_path
