@@ -559,7 +559,7 @@ def load_checkpoint(checkpoint_path: Optional[Path]) -> Optional[Dict[str, Any]]
         return None
     if not checkpoint_path.exists():
         raise FileNotFoundError(f"Checkpoint {checkpoint_path} does not exist.")
-    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     if "model_state" not in checkpoint:
         checkpoint = {"model_state": checkpoint}
     checkpoint["__path__"] = str(checkpoint_path)
