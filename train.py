@@ -26,10 +26,13 @@ from utils import (
     compute_positions_3d,
 )
 
-# Prefer TF32 on capable CUDA hardware (new API replaces allow_tf32 flags).
+# Prefer TF32 on capable CUDA hardware using the new fp32_precision API.
 if torch.cuda.is_available():
-    torch.backends.cuda.matmul.fp32_precision = "high"
+    torch.backends.fp32_precision = "tf32"
+    torch.backends.cuda.matmul.fp32_precision = "tf32"
+    torch.backends.cudnn.fp32_precision = "tf32"
     torch.backends.cudnn.conv.fp32_precision = "tf32"
+    torch.backends.cudnn.rnn.fp32_precision = "tf32"
 
 DEFAULT_DATA_PATH = Path("assets/ARC-2/grouped-tasks/training/challenges.json")
 
@@ -131,14 +134,21 @@ def resolve_device(device_str: str) -> torch.device:
 
 def _capture_rng_state(device: torch.device) -> Dict[str, Any]:
     """Capture Python/numpy/torch RNG states so training can resume deterministically."""
-    state: Dict[str, Any] = {"python": random.getstate(), "numpy": np.random.get_state()}
+    state: Dict[str, Any] = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+    }
     state["torch"] = torch.get_rng_state()
     if torch.cuda.is_available() and device.type == "cuda":
         try:
             state["cuda"] = torch.cuda.get_rng_state_all()
         except Exception:
             pass
-    if hasattr(torch, "mps") and torch.backends.mps.is_available() and device.type == "mps":
+    if (
+        hasattr(torch, "mps")
+        and torch.backends.mps.is_available()
+        and device.type == "mps"
+    ):
         try:
             state["mps"] = torch.mps.get_rng_state()
         except Exception:
@@ -167,7 +177,12 @@ def _restore_rng_state(state: Optional[Dict[str, Any]], device: torch.device) ->
             torch.cuda.set_rng_state_all(state["cuda"])
         except Exception:
             pass
-    if "mps" in state and hasattr(torch, "mps") and torch.backends.mps.is_available() and device.type == "mps":
+    if (
+        "mps" in state
+        and hasattr(torch, "mps")
+        and torch.backends.mps.is_available()
+        and device.type == "mps"
+    ):
         try:
             torch.mps.set_rng_state(state["mps"])
         except Exception:
@@ -568,8 +583,7 @@ def infer_num_examples_from_checkpoint(
 
 
 def build_model_and_data(
-    args: argparse.Namespace,
-    checkpoint: Optional[Dict[str, Any]] = None,
+    args: argparse.Namespace, checkpoint: Optional[Dict[str, Any]] = None
 ) -> Tuple[
     TinyTransformer, ARCExampleDataset, torch.utils.data.DataLoader, torch.device, Path
 ]:
@@ -580,7 +594,9 @@ def build_model_and_data(
     """
     set_seed(args.seed)
     device = resolve_device(args.device)
-    checkpoint = checkpoint if checkpoint is not None else load_checkpoint(args.checkpoint_path)
+    checkpoint = (
+        checkpoint if checkpoint is not None else load_checkpoint(args.checkpoint_path)
+    )
     # Restore RNG so data shuffling / dropout continue seamlessly after resuming.
     if checkpoint:
         _restore_rng_state(checkpoint.get("rng_state"), device)
