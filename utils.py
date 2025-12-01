@@ -148,10 +148,13 @@ def compute_positions_3d(
             if not mask_cpu[b, t]:
                 continue
             tok = int(ids_cpu[b, t].item())
-            if t == 0 and tok == START_TOKEN_ID:
+            if tok == START_TOKEN_ID:
                 pos[b, t, 0] = 0
                 pos[b, t, 1] = 0
                 pos[b, t, 2] = 0
+                x = 0
+                y = 0
+                z = 1
                 continue
 
             if tok == IO_SEPARATOR_TOKEN_ID:
@@ -508,10 +511,7 @@ def create_dataloader(
 
     bucket_size = max(batch_size * max(1, bucket_size_multiplier), batch_size)
     batch_sampler = LengthBucketBatchSampler(
-        lengths=lengths,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        bucket_size=bucket_size,
+        lengths=lengths, batch_size=batch_size, shuffle=shuffle, bucket_size=bucket_size
     )
     return DataLoader(
         dataset,

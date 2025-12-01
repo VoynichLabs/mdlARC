@@ -69,18 +69,14 @@ class BatchGridState:
 
 
 def _left_pad_sequences(
-    sequences: Sequence[Sequence[int]],
-    pad_token_id: int,
-    device: torch.device,
+    sequences: Sequence[Sequence[int]], pad_token_id: int, device: torch.device
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     batch_size = len(sequences)
     max_len = max(len(seq) for seq in sequences)
     input_ids = torch.full(
         (batch_size, max_len), pad_token_id, dtype=torch.long, device=device
     )
-    attention_mask = torch.zeros(
-        (batch_size, max_len), dtype=torch.bool, device=device
-    )
+    attention_mask = torch.zeros((batch_size, max_len), dtype=torch.bool, device=device)
     for idx, seq in enumerate(sequences):
         seq_len = len(seq)
         start = max_len - seq_len
@@ -105,24 +101,28 @@ def _pad_cached_positions(
 def _derive_initial_state_from_prompt(
     input_ids: torch.Tensor, positions_3d: torch.Tensor, attention_mask: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    batch_size = input_ids.size(0)
-    lengths = attention_mask.sum(dim=1)
-    last_indices = torch.clamp(lengths - 1, min=0)
-    batch_indices = torch.arange(batch_size, device=input_ids.device)
+    # Since input_ids are left-padded by _left_pad_sequences, the last valid token
+    # (the one determining the start state for generation) is always at the very end.
+    last_tokens = input_ids[:, -1]
+    last_positions = positions_3d[:, -1]
 
-    last_tokens = input_ids[batch_indices, last_indices]
-    last_positions = positions_3d[batch_indices, last_indices]
     x, y, z = last_positions.unbind(-1)
 
     next_x = x + 1
     next_y = y
     next_z = z
 
-    next_x = torch.where(last_tokens == NEXT_LINE_TOKEN_ID, torch.zeros_like(next_x), next_x)
+    next_x = torch.where(
+        last_tokens == NEXT_LINE_TOKEN_ID, torch.zeros_like(next_x), next_x
+    )
     next_y = torch.where(last_tokens == NEXT_LINE_TOKEN_ID, y + 1, next_y)
 
-    next_x = torch.where(last_tokens == IO_SEPARATOR_TOKEN_ID, torch.zeros_like(next_x), next_x)
-    next_y = torch.where(last_tokens == IO_SEPARATOR_TOKEN_ID, torch.zeros_like(next_y), next_y)
+    next_x = torch.where(
+        last_tokens == IO_SEPARATOR_TOKEN_ID, torch.zeros_like(next_x), next_x
+    )
+    next_y = torch.where(
+        last_tokens == IO_SEPARATOR_TOKEN_ID, torch.zeros_like(next_y), next_y
+    )
     next_z = torch.where(
         last_tokens == IO_SEPARATOR_TOKEN_ID, torch.full_like(next_z, 3), next_z
     )
@@ -131,8 +131,12 @@ def _derive_initial_state_from_prompt(
     next_y = torch.where(last_tokens == END_TOKEN_ID, y, next_y)
     next_z = torch.where(last_tokens == END_TOKEN_ID, z, next_z)
 
-    next_x = torch.where(last_tokens == START_TOKEN_ID, torch.zeros_like(next_x), next_x)
-    next_y = torch.where(last_tokens == START_TOKEN_ID, torch.zeros_like(next_y), next_y)
+    next_x = torch.where(
+        last_tokens == START_TOKEN_ID, torch.zeros_like(next_x), next_x
+    )
+    next_y = torch.where(
+        last_tokens == START_TOKEN_ID, torch.zeros_like(next_y), next_y
+    )
     next_z = torch.where(last_tokens == START_TOKEN_ID, torch.ones_like(next_z), next_z)
 
     initial_state = torch.stack([next_x, next_y, next_z], dim=-1)
@@ -154,7 +158,9 @@ def batched_greedy_generate(
     if len(prompts) != len(example_ids):
         raise ValueError("prompts and example_ids must have the same length.")
     if cached_positions is not None and len(cached_positions) != len(prompts):
-        raise ValueError("cached_positions must be None or match the number of prompts.")
+        raise ValueError(
+            "cached_positions must be None or match the number of prompts."
+        )
 
     model.eval()
     batch_size = len(prompts)
@@ -167,9 +173,8 @@ def batched_greedy_generate(
         prompts, pad_token_id=END_TOKEN_ID, device=device
     )
 
-    use_cached_positions = (
-        cached_positions is not None
-        and all(pos is not None for pos in cached_positions)
+    use_cached_positions = cached_positions is not None and all(
+        pos is not None for pos in cached_positions
     )
 
     if use_cached_positions:
@@ -240,10 +245,10 @@ def batched_greedy_generate(
 
 
 def _select_inference_examples(
-    dataset,
-    task_ids: Sequence[str],
-    pair_index: int = 0,
-) -> Tuple[List[List[int]], List[int], List[Dict[str, object]], List[Optional[torch.Tensor]]]:
+    dataset, task_ids: Sequence[str], pair_index: int = 0
+) -> Tuple[
+    List[List[int]], List[int], List[Dict[str, object]], List[Optional[torch.Tensor]]
+]:
     prompts: List[List[int]] = []
     example_ids: List[int] = []
     metadata: List[Dict[str, object]] = []
