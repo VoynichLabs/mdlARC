@@ -88,17 +88,6 @@ def parse_args() -> argparse.Namespace:
         help="Print the exact prompt sequence used for inference.",
     )
     parser.add_argument(
-        "--log-eval-strings",
-        action="store_true",
-        help="During evaluate, print prompt and generated strings for a few examples.",
-    )
-    parser.add_argument(
-        "--log-eval-limit",
-        type=int,
-        default=3,
-        help="Max number of eval examples to log.",
-    )
-    parser.add_argument(
         "--plot-inference-grids",
         action="store_true",
         help="During single-example inference, plot input/output grids.",
@@ -342,9 +331,7 @@ def greedy_generate(
     prompt_attention = torch.ones_like(prompt, dtype=torch.bool)
     if cached_positions is not None:
         prompt_positions = cached_positions.unsqueeze(0)
-        x, y, z = _derive_state_from_prompt_positions(
-            prompt_tokens, cached_positions
-        )
+        x, y, z = _derive_state_from_prompt_positions(prompt_tokens, cached_positions)
     else:
         prompt_positions = compute_positions_3d(prompt, prompt_attention)
         x, y, z = 0, 0, 1
@@ -470,95 +457,6 @@ def run_inference(
             plot_grids(to_plot, title=f"task {task_id} pair {pair_index}")
         except Exception as e:
             print(f"Plotting failed: {e}")
-
-
-@torch.no_grad()
-def evaluate_dataset(
-    model: TinyTransformer,
-    dataset: ARCExampleDataset,
-    data_path: Path,
-    device: torch.device,
-    log_eval_strings: bool = False,
-    log_eval_limit: int = 0,
-) -> None:
-    """Run greedy inference over all test pairs and compute exact-match accuracy.
-
-    Uses the companion solutions.json alongside the provided challenges.json to
-    compare predictions against ground truth for test pairs.
-    """
-    # Solutions are stored next to the challenges.json
-    solutions_path = data_path.parent / "solutions.json"
-    if not solutions_path.exists():
-        print(f"solutions.json not found at {solutions_path}; skipping eval.")
-        return
-
-    # Load solutions mapping: task_id -> list of output grids for test pairs
-    import json
-
-    with solutions_path.open("r") as f:
-        solutions = json.load(f)
-
-    total = 0
-    correct = 0
-    logged = 0
-
-    # Evaluate only on test pairs without provided outputs (i.e., challenge test pairs)
-    for example in dataset.iter_examples(split="test", has_output=False):
-        # Guard against missing solutions
-        sols = solutions.get(example.task_id)
-        if not sols:
-            continue
-        if example.pair_index >= len(sols):
-            continue
-
-        # Prepare prompt and generate
-        # Optional: print prompt before generation
-        if log_eval_strings and logged < log_eval_limit:
-            print(
-                "\n[eval prompt]",
-                f"task={example.task_id}",
-                f"pair={example.pair_index}",
-            )
-            print("str:", tokens_to_string(example.tokens.tolist()))
-
-        generated = greedy_generate(
-            model=model,
-            prompt_tokens=example.tokens,
-            cached_positions=example.cached_positions,
-            example_id=example.example_id,
-            device=device,
-        )
-        full_sequence = generated.tolist()
-        output_tokens = extract_output_tokens(full_sequence)
-        predicted_grid = tokens_to_grid(output_tokens)
-        reference_grid = sols[example.pair_index]
-
-        # Optional: print generated sequence
-        if log_eval_strings and logged < log_eval_limit:
-            print(
-                "[eval generated raw]",
-                f"task={example.task_id}",
-                f"pair={example.pair_index}",
-            )
-            print("str:", tokens_to_string(full_sequence))
-            print(
-                "[eval generated]",
-                f"task={example.task_id}",
-                f"pair={example.pair_index}",
-            )
-            print("str:", tokens_to_string(output_tokens))
-            logged += 1
-
-        is_match = predicted_grid == reference_grid
-        total += 1
-        correct += int(is_match)
-
-    if total == 0:
-        print("No evaluable test pairs found; skipping eval.")
-        return
-
-    acc = 100.0 * correct / total
-    print(f"\nEval: {correct}/{total} correct ({acc:.2f}%)")
 
 
 def maybe_save_model(
@@ -752,24 +650,6 @@ def train_model(
     )
 
 
-def evaluate_model(
-    args: argparse.Namespace,
-    model: TinyTransformer,
-    dataset: ARCExampleDataset,
-    device: torch.device,
-    data_path: Path,
-) -> None:
-    """Evaluate a model on the ARC test split using solutions.json."""
-    evaluate_dataset(
-        model=model,
-        dataset=dataset,
-        data_path=data_path,
-        device=device,
-        log_eval_strings=args.log_eval_strings,
-        log_eval_limit=args.log_eval_limit,
-    )
-
-
 def run(args: argparse.Namespace) -> None:
     checkpoint = load_checkpoint(args.checkpoint_path)
     model, dataset, dataloader, device, data_path = build_model_and_data(
@@ -777,9 +657,7 @@ def run(args: argparse.Namespace) -> None:
     )
 
     if not args.eval_only:
-        # Train then auto-evaluate on test pairs from the same dataset
-        # (using solutions.json). This mirrors the original behavior but
-        # now delegates to dedicated train / eval helpers.
+        # MODE 1: Training
         train_model(
             args=args,
             model=model,
@@ -789,12 +667,11 @@ def run(args: argparse.Namespace) -> None:
             data_path=data_path,
             checkpoint=checkpoint,
         )
-        evaluate_model(
-            args=args, model=model, dataset=dataset, device=device, data_path=data_path
-        )
+        # Note: evaluate_model() call is removed here
     else:
-        # Eval-only mode: if a specific task is provided, run single-example inference.
-        # Otherwise, evaluate all test pairs using solutions.json.
+        # MODE 2: Inference
+        # We enforce that a task ID must be present, because we deleted
+        # the "fallback" that used to evaluate the whole dataset.
         if args.inference_task_id:
             run_inference(
                 model=model,
@@ -806,13 +683,9 @@ def run(args: argparse.Namespace) -> None:
                 plot_grids_flag=args.plot_inference_grids,
             )
         else:
-            evaluate_dataset(
-                model=model,
-                dataset=dataset,
-                data_path=data_path,
-                device=device,
-                log_eval_strings=args.log_eval_strings,
-                log_eval_limit=args.log_eval_limit,
+            raise ValueError(
+                "In eval_only mode, you must provide --inference-task-id "
+                "to run single-example inference."
             )
 
 
