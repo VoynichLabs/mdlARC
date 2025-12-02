@@ -105,7 +105,7 @@ def train_one_epoch(
     start_step: int = 0,
     log_train_strings: bool = False,
     log_train_limit: int = 0,
-    log_file: Optional[Path] = None,  # <--- NEW ARGUMENT
+    log_file: Optional[Path] = None,
 ) -> int:
     model.train()
     step = start_step
@@ -113,6 +113,7 @@ def train_one_epoch(
     logged = 0
     for batch in dataloader:
         step += 1
+        # print(f"DEBUG: Step {step} sequence index: {batch['example_ids'][0].item()}")
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
@@ -255,7 +256,7 @@ def infer_num_examples_from_checkpoint(
 def build_model_and_data(
     args: argparse.Namespace,
     checkpoint: Optional[Dict[str, Any]] = None,
-    reuse_dataset: Optional[ARCExampleDataset] = None,  # <--- NEW ARGUMENT
+    reuse_dataset: Optional[ARCExampleDataset] = None,
 ) -> Tuple[
     TinyTransformer, ARCExampleDataset, torch.utils.data.DataLoader, torch.device, Path
 ]:
@@ -287,7 +288,6 @@ def build_model_and_data(
     if checkpoint and "task_ids" in checkpoint:
         task_whitelist = checkpoint["task_ids"]
 
-    # --- START OF CHANGED BLOCK ---
     if reuse_dataset is not None:
         print("Reusing existing dataset from RAM (skipping 3D pre-computation).")
         dataset = reuse_dataset
@@ -299,7 +299,6 @@ def build_model_and_data(
             max_seq_len=MAX_SEQ_LEN,
             task_whitelist=task_whitelist,
         )
-    # --- END OF CHANGED BLOCK ---
 
     # We always recreate the dataloader because batch_size might have changed in args
     dataloader = create_dataloader(
@@ -378,10 +377,19 @@ def train_model(
 
     # print(f"DEBUG CHECK: Optimizer state size = {len(optimizer.state)} (0 = Fresh/Reset, >0 = Restored)")
 
+    # Compile a specific reference for training execution only.
+    # We do this AFTER optimizer loading to ensure parameter consistency.
+    # We check for CUDA because compile support on MPS/CPU can be flaky or slower.
+    if hasattr(torch, "compile") and device.type == "cuda":
+        print("Compiling model for training speedup...")
+        training_model = torch.compile(model)
+    else:
+        training_model = model
+
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
         step = train_one_epoch(
-            model=model,
+            model=training_model,
             dataloader=dataloader,
             optimizer=optimizer,
             device=device,
