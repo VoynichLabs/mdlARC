@@ -23,7 +23,7 @@ class TinyTransformerConfig:
     d_ff: int = 512
     n_layers: int = 4
     dropout: float = 0.1
-    num_examples: int = 1024
+    num_examples: int = 1280
 
     def __post_init__(self) -> None:
         if self.d_model % self.n_heads != 0:
