@@ -299,6 +299,7 @@ class ARCExampleDataset(Dataset):
         max_seq_len: int = MAX_SEQ_LEN,
         drop_long_sequences: bool = False,
         task_whitelist: Optional[Sequence[str]] = None,
+        load_test_solutions: bool = False,
     ) -> None:
         available_splits = {"train", "test"}
         for split in splits:
@@ -313,6 +314,15 @@ class ARCExampleDataset(Dataset):
         self.include_outputs = include_outputs
 
         challenges = load_challenges(self.source_path)
+
+        solutions_map = {}
+        if load_test_solutions:
+            sol_path = self.source_path.with_name("solutions.json")
+            if sol_path.exists():
+                with sol_path.open("r") as handle:
+                    solutions_map = json.load(handle)
+            else:
+                print(f"Warning: solutions.json not found at {sol_path}")
         if task_whitelist is not None:
             task_ids = list(task_whitelist)
             missing = [task_id for task_id in task_ids if task_id not in challenges]
@@ -333,12 +343,26 @@ class ARCExampleDataset(Dataset):
             for split in splits:
                 pairs = task.get(split, [])
                 for pair_index, pair in enumerate(pairs):
-                    has_output = "output" in pair and pair["output"] is not None
+                    input_grid = pair["input"]
+                    output_grid = pair.get(
+                        "output"
+                    )  # Valid for 'train', usually None for 'test'
+
+                    # Explicitly fetch test outputs from solutions_map if allowed
+                    if split == "test" and load_test_solutions:
+                        if task_id in solutions_map:
+                            task_sols = solutions_map[task_id]
+                            if pair_index < len(task_sols):
+                                output_grid = task_sols[pair_index]
+
+                    # Standard logic follows
+                    has_output = output_grid is not None
                     include_output_tokens = include_outputs and has_output
                     append_end = include_output_tokens
+
                     tokens = encode_example(
-                        pair["input"],
-                        pair.get("output"),
+                        input_grid,
+                        output_grid,
                         include_output=include_output_tokens,
                         append_end=append_end,
                     )
