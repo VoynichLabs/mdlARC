@@ -242,7 +242,6 @@ def batched_greedy_generate(
     if steps_remaining <= 0 or finished.all():
         return [list(seq) for seq in prompts]
 
-    generated: List[List[int]] = [list(seq) for seq in prompts]
     steps = 0
     while steps < steps_remaining and not finished.all():
         next_token = torch.argmax(logits[:, -1, :], dim=-1)
