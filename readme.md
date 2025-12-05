@@ -1,15 +1,18 @@
 ***In progress, I expect improvements till 30%***
-# 10% on ARC-1 with a 1M transformer
+# 10% on ARC-1 for less than a dollar using a 1M transformer
 
 
 ## Self supervised compression on ARC
 
-Every DL approach on ARC today trains a supervised algorithm
+Every DL approach on ARC today^[1] trains a supervised algorithm
 
-This is stupid.  
+This is dumb.  
 A self-supervised compression step will obviously perform better:
 - There is new information in the input grids and private puzzles that is currently uncompressed
 - Test grids have distribution shifts. Compression will push these grids into distribution
+
+
+For more reasoning behind the approach, read **[My Blog](https://mvakde.github.io/blog/why-all-ARC-solvers-fail-today/)**
 
 ---
 
@@ -21,6 +24,9 @@ Total compute cost - **$0.709**
 
 This is early performance. Haven't run all ablations yet
 
-I should be able to push to 30% on ARC-1 and 8% on ARC-2  
+I should be able to push to 30% on ARC-1 and 8% on ARC-2
 
-For the reasoining behind the approach, read **[My Blog](https://mvakde.github.io/blog/why-all-ARC-solvers-fail-today/)**
+
+
+
+[^1]: CompressARC is an exception, but that compresses each task individually. Mine jointly compresses all tasks together
