@@ -43,7 +43,7 @@ class MultiHeadSelfAttention(nn.Module):
 
         self.qkv_proj = nn.Linear(config.d_model, 3 * config.d_model, bias=False)
         self.out_proj = nn.Linear(config.d_model, config.d_model, bias=False)
-        self.dropout = nn.Dropout(config.dropout)
+        self.dropout_p = config.dropout  # Store float for functional call
 
         # 3D RoPE setup
         self.rope = RotaryEmbedding3D(self.head_dim)
@@ -66,29 +66,46 @@ class MultiHeadSelfAttention(nn.Module):
             # pos_xyz: [B, S, 3] (x, y, z)
             queries, keys = self.rope.apply_rotary(queries, keys, pos_xyz)
 
-        attn_scores = torch.matmul(queries, keys.transpose(-2, -1)) * self.scale
+        # Construct a combined attention bias for SDPA
+        # SDPA handles broadcasting, but constructing the mask explicitly ensures
+        # correctness with your specific causal + padding setup.
+        attn_bias = None
 
+        # 1. Start with Causal Mask if present
         if causal_mask is not None:
-            attn_scores = attn_scores.masked_fill(causal_mask, float("-inf"))
+            # causal_mask is usually boolean [1, 1, S, S] where True means "Mask out"
+            # We convert to float: 0.0 for keep, -inf for mask
+            attn_bias = torch.zeros(
+                (1, 1, seq_len, seq_len), device=queries.device, dtype=queries.dtype
+            )
+            attn_bias = attn_bias.masked_fill(causal_mask, float("-inf"))
 
+        # 2. Apply Padding Mask (attention_mask)
         if attention_mask is not None:
+            # attention_mask is [B, S] where True means "Keep", False means "Pad"
+            # We need to mask out keys where attention_mask is False.
+            if attn_bias is None:
+                attn_bias = torch.zeros(
+                    (batch_size, 1, seq_len, seq_len),
+                    device=queries.device,
+                    dtype=queries.dtype,
+                )
+
+            # Broadcast attention_mask to [B, 1, 1, S]
             key_mask = ~attention_mask[:, None, None, :]
-            attn_scores = attn_scores.masked_fill(key_mask, float("-inf"))
+            attn_bias = attn_bias.masked_fill(key_mask, float("-inf"))
 
-        # Also mask out queries that correspond to padding so we don't
-        # softmax rows that are entirely -inf (which would produce NaNs
-        # for left-padded batches).
-        query_mask = (
-            attention_mask[:, None, :, None] if attention_mask is not None else None
+        # Fused Flash Attention execution
+        # Note: We pass is_causal=False because we manually constructed the causal mask into attn_bias above
+        attn_output = F.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            attn_mask=attn_bias,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=False,
         )
-        if query_mask is not None:
-            attn_scores = attn_scores.masked_fill(~query_mask, 0.0)
 
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        if query_mask is not None:
-            attn_weights = attn_weights * query_mask
-        attn_output = torch.matmul(attn_weights, values)
         attn_output = (
             attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, dim)
         )
@@ -103,15 +120,6 @@ class MultiHeadSelfAttention(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cache_position: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """Self-attention variant that also exposes a KV cache.
-
-        When `past_key_value` is None, this reduces to the normal attention
-        computation (including causal and padding masks) while returning
-        the per-layer keys/values for caching. When `past_key_value` is
-        provided, `hidden_states` and `pos_xyz` should contain only the
-        newly generated tokens and no masking is applied, since there are
-        no future positions during autoregressive decoding.
-        """
         batch_size, seq_len, dim = hidden_states.shape
 
         qkv = self.qkv_proj(hidden_states)
@@ -131,82 +139,80 @@ class MultiHeadSelfAttention(nn.Module):
                     device=queries.device, dtype=torch.bool
                 )
 
-        # Incremental decoding branch: concatenate cached K/V and attend
-        # from the new tokens only. No causal mask is needed because there
-        # are no future positions beyond the newly appended tokens.
+        # --- Incremental Decoding (KV Cache) ---
         if past_key_value is not None:
             past_keys, past_values = past_key_value
             if cache_position is not None:
-                # Optimized Path: In-place update of pre-allocated buffer
-                # 1. Write new token's K/V to the specific position
+                # Optimized Path: In-place update
                 past_keys[:, :, cache_position : cache_position + seq_len, :] = keys
                 past_values[:, :, cache_position : cache_position + seq_len, :] = values
-
-                # 2. View the buffer only up to the current length for attention
                 keys = past_keys[:, :, : cache_position + seq_len, :]
                 values = past_values[:, :, : cache_position + seq_len, :]
             else:
-                # Slow Path: Legacy torch.cat behavior
+                # Legacy Path
                 keys = torch.cat([past_keys, keys], dim=2)
                 values = torch.cat([past_values, values], dim=2)
-            if attention_mask is not None:
-                attention_mask = attention_mask.to(device=keys.device, dtype=torch.bool)
-                if attention_mask.dim() != 2 or attention_mask.size(1) != keys.size(2):
-                    raise ValueError(
-                        "attention_mask must have shape [batch, total_seq_len] when using KV cache."
-                    )
 
-            attn_scores = torch.matmul(queries, keys.transpose(-2, -1)) * self.scale
+            # Construct Mask for SDPA
+            attn_bias = None
             if attention_mask is not None:
+                # attention_mask covers the full history: [B, total_seq_len]
+                # True = Keep, False = Mask
+                attn_bias = torch.zeros(
+                    (batch_size, 1, seq_len, keys.size(2)),
+                    device=queries.device,
+                    dtype=queries.dtype,
+                )
                 key_mask = ~attention_mask[:, None, None, :]
-                attn_scores = attn_scores.masked_fill(key_mask, float("-inf"))
-            query_mask = (
-                attention_mask[:, None, -seq_len:, None]
-                if attention_mask is not None
-                else None
+                attn_bias = attn_bias.masked_fill(key_mask, float("-inf"))
+
+            # Fused Attention (1 token query vs N tokens keys)
+            attn_output = F.scaled_dot_product_attention(
+                queries,
+                keys,
+                values,
+                attn_mask=attn_bias,
+                dropout_p=self.dropout_p if self.training else 0.0,
+                is_causal=False,
             )
-            if query_mask is not None:
-                attn_scores = attn_scores.masked_fill(~query_mask, 0.0)
-            attn_weights = F.softmax(attn_scores, dim=-1)
-            attn_weights = self.dropout(attn_weights)
-            if query_mask is not None:
-                attn_weights = attn_weights * query_mask
-            attn_output = torch.matmul(attn_weights, values)
+
             attn_output = (
                 attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, dim)
             )
-            attn_output = self.out_proj(attn_output)
-            present_key_value = (keys, values)
-            return attn_output, present_key_value
+            return self.out_proj(attn_output), (keys, values)
 
-        # Full-sequence branch used for the initial prompt: this mirrors
-        # the standard attention forward (including causal and padding
-        # masks) while also returning K/V for caching.
-        attn_scores = torch.matmul(queries, keys.transpose(-2, -1)) * self.scale
-
+        # --- Initial Prompt (Standard Forward) ---
+        # This mirrors the logic in self.forward but returns K/V
+        attn_bias = None
         if causal_mask is not None:
-            attn_scores = attn_scores.masked_fill(causal_mask, float("-inf"))
+            attn_bias = torch.zeros(
+                (1, 1, seq_len, seq_len), device=queries.device, dtype=queries.dtype
+            )
+            attn_bias = attn_bias.masked_fill(causal_mask, float("-inf"))
 
         if attention_mask is not None:
+            if attn_bias is None:
+                attn_bias = torch.zeros(
+                    (batch_size, 1, seq_len, seq_len),
+                    device=queries.device,
+                    dtype=queries.dtype,
+                )
             key_mask = ~attention_mask[:, None, None, :]
-            attn_scores = attn_scores.masked_fill(key_mask, float("-inf"))
-        query_mask = (
-            attention_mask[:, None, :, None] if attention_mask is not None else None
-        )
-        if query_mask is not None:
-            attn_scores = attn_scores.masked_fill(~query_mask, 0.0)
+            attn_bias = attn_bias.masked_fill(key_mask, float("-inf"))
 
-        attn_weights = F.softmax(attn_scores, dim=-1)
-        attn_weights = self.dropout(attn_weights)
-        if query_mask is not None:
-            attn_weights = attn_weights * query_mask
-        attn_output = torch.matmul(attn_weights, values)
+        attn_output = F.scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            attn_mask=attn_bias,
+            dropout_p=self.dropout_p if self.training else 0.0,
+            is_causal=False,
+        )
+
         attn_output = (
             attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, dim)
         )
-        attn_output = self.out_proj(attn_output)
-        present_key_value = (keys, values)
-        return attn_output, present_key_value
+        return self.out_proj(attn_output), (keys, values)
 
 
 class FeedForward(nn.Module):
