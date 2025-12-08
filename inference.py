@@ -328,7 +328,7 @@ def _prepare_examples_for_inference(
     examples: Sequence[object],
     include_targets: bool = False,
     solutions: Optional[Dict[Tuple[str, int], List[List[int]]]] = None,
-    color_mapping: Optional[Sequence[int]] = None,
+    color_mappings: Optional[Sequence[Optional[Sequence[int]]]] = None,
     color_apply_fn: Optional[Callable[[str], bool]] = None,
 ) -> Tuple[
     List[List[int]],
@@ -343,16 +343,20 @@ def _prepare_examples_for_inference(
     cached_positions: List[Optional[torch.Tensor]] = []
     target_tokens: List[List[int]] = []
 
-    for ex in examples:
+    for idx, ex in enumerate(examples):
         if not hasattr(ex, "tokens"):
             raise ValueError("Examples must provide a 'tokens' attribute.")
         raw_tokens = ex.tokens.tolist()
         split = getattr(ex, "split", None)
-        should_color = color_mapping is not None and (
+
+        # Select the specific mapping for this example
+        mapping = color_mappings[idx] if color_mappings is not None else None
+
+        should_color = mapping is not None and (
             color_apply_fn is None or color_apply_fn(split)
         )
         tokens = (
-            apply_color_permutation_to_tokens(raw_tokens, color_mapping)
+            apply_color_permutation_to_tokens(raw_tokens, mapping)
             if should_color
             else raw_tokens
         )
@@ -373,9 +377,7 @@ def _prepare_examples_for_inference(
             if key in solutions and solutions[key] is not None:
                 target_grid = solutions[key]
                 if should_color:
-                    target_grid = apply_color_permutation_to_grid(
-                        target_grid, color_mapping
-                    )
+                    target_grid = apply_color_permutation_to_grid(target_grid, mapping)
                 targets = grid_to_tokens(target_grid)
         target_tokens.append(targets)
         metadata.append(
@@ -526,52 +528,62 @@ def run_split_inference(
     color_variants: List[Optional[Sequence[int]]] = (
         list(color_mappings) if color_mappings is not None else [None]
     )
+
+    # Flatten the workload: Create a job for every (Example, ColorMapping) pair
+    work_items = []
+    for c_idx, mapping in enumerate(color_variants):
+        for ex in examples:
+            work_items.append((ex, c_idx, mapping))
+
+    # Sort ALL work items by sequence length (descending) to minimize padding.
+    # Note: Color permutation maps digits 1-to-1, so ex.seq_len is invariant.
+    work_items.sort(key=lambda item: item[0].seq_len, reverse=True)
+
     all_results: List[Dict[str, object]] = []
 
-    for color_idx, color_mapping in enumerate(color_variants):
-        # Sort by sequence length to keep padding overhead low, then restore order.
-        indexed_examples = list(enumerate(examples))
-        indexed_examples.sort(key=lambda pair: pair[1].seq_len, reverse=True)
-        results_buffer: List[Optional[Dict[str, object]]] = [None] * len(examples)
+    for start in range(0, len(work_items), batch_size):
+        chunk = work_items[start : start + batch_size]
 
-        for start in range(0, len(indexed_examples), batch_size):
-            chunk = indexed_examples[start : start + batch_size]
-            batch_indices, batch_examples = zip(*chunk)
-            (prompts, example_ids, metadata, cached_positions, target_output_tokens) = (
-                _prepare_examples_for_inference(
-                    batch_examples,
-                    include_targets=include_targets,
-                    solutions=solutions,
-                    color_mapping=color_mapping,
-                    color_apply_fn=color_apply_fn,
+        # Unzip the batch components
+        batch_examples = [item[0] for item in chunk]
+        batch_c_indices = [item[1] for item in chunk]
+        batch_mappings = [item[2] for item in chunk]
+
+        (prompts, example_ids, metadata, cached_positions, target_output_tokens) = (
+            _prepare_examples_for_inference(
+                batch_examples,
+                include_targets=include_targets,
+                solutions=solutions,
+                color_mappings=batch_mappings,  # Pass the batch-specific mappings
+                color_apply_fn=color_apply_fn,
+            )
+        )
+        if log_prompts:
+            for meta, prompt in zip(metadata, prompts):
+                print(
+                    "[prompt]",
+                    f"split={meta.get('split')}",
+                    f"task={meta.get('task_id')}",
+                    f"pair={meta.get('pair_index')}",
+                    "::",
+                    tokens_to_string(prompt),
                 )
-            )
-            if log_prompts:
-                for meta, prompt in zip(metadata, prompts):
-                    print(
-                        "[prompt]",
-                        f"split={meta.get('split')}",
-                        f"task={meta.get('task_id')}",
-                        f"pair={meta.get('pair_index')}",
-                        "::",
-                        tokens_to_string(prompt),
-                    )
-            batch_results = _run_generation_batch(
-                model=model,
-                prompts=prompts,
-                example_ids=example_ids,
-                metadata=metadata,
-                cached_positions=cached_positions,
-                device=device,
-                max_new_tokens=max_new_tokens,
-                target_output_tokens=target_output_tokens if include_targets else None,
-            )
-            for idx, res in zip(batch_indices, batch_results):
-                if color_mapping is not None:
-                    res["color_permutation_index"] = color_idx
-                results_buffer[idx] = res
+        batch_results = _run_generation_batch(
+            model=model,
+            prompts=prompts,
+            example_ids=example_ids,
+            metadata=metadata,
+            cached_positions=cached_positions,
+            device=device,
+            max_new_tokens=max_new_tokens,
+            target_output_tokens=target_output_tokens if include_targets else None,
+        )
 
-        all_results.extend(res for res in results_buffer if res is not None)
+        # Attach the correct color index to each result and collect
+        for res, c_idx in zip(batch_results, batch_c_indices):
+            if color_mappings is not None:
+                res["color_permutation_index"] = c_idx
+            all_results.append(res)
 
     return all_results
 
