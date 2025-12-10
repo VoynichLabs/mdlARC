@@ -654,8 +654,8 @@ class RotaryEmbedding3D(nn.Module):
         q, k: [B, H, S, D]
         pos_xyz: [B, S, 3] with integer coordinates (x, y, z)
         """
-        B, H, S, D = q.shape
-        assert D == self.head_dim
+        # B, H, S, D = q.shape
+        # assert D == self.head_dim
 
         # Ensure indices are within bounds (clamping protects against out-of-bounds crash)
         # pos_xyz is expected to be LongTensor suitable for indexing.
@@ -663,45 +663,31 @@ class RotaryEmbedding3D(nn.Module):
         pos_y = pos_xyz[..., 1].clamp(0, self.max_y - 1)
         pos_z = pos_xyz[..., 2].clamp(0, self.max_z - 1)
 
-        # Slices
-        dx, dy, dz = self.d_x, self.d_y, self.d_z
-        s0 = 0
-        s1 = s0 + dx
-        s2 = s1 + dy
-        s3 = s2 + dz
+        parts_cos = []
+        parts_sin = []
 
-        q_x, q_y, q_z = q[..., s0:s1], q[..., s1:s2], q[..., s2:s3]
-        k_x, k_y, k_z = k[..., s0:s1], k[..., s1:s2], k[..., s2:s3]
+        # Gather cached Cos/Sin tables based on positions.
+        # Note: self.cos_x_cache is [MaxPos, dx] -> Gather creates [B, S, dx]
+        if self.d_x > 0:
+            parts_cos.append(self.cos_x_cache[pos_x])
+            parts_sin.append(self.sin_x_cache[pos_x])
 
-        # Apply rotations using cached lookups
-        # Shape: [B, S] -> Lookup [B, S, D_slice] -> Unsqueeze [B, 1, S, D_slice] (broadcast over heads)
+        if self.d_y > 0:
+            parts_cos.append(self.cos_y_cache[pos_y])
+            parts_sin.append(self.sin_y_cache[pos_y])
 
-        if dx > 0:
-            cos_x = self.cos_x_cache[pos_x].unsqueeze(1)
-            sin_x = self.sin_x_cache[pos_x].unsqueeze(1)
-            q_x = q_x * cos_x + self._rotate_half(q_x) * sin_x
-            k_x = k_x * cos_x + self._rotate_half(k_x) * sin_x
+        if self.d_z > 0:
+            parts_cos.append(self.cos_z_cache[pos_z])
+            parts_sin.append(self.sin_z_cache[pos_z])
 
-        if dy > 0:
-            cos_y = self.cos_y_cache[pos_y].unsqueeze(1)
-            sin_y = self.sin_y_cache[pos_y].unsqueeze(1)
-            q_y = q_y * cos_y + self._rotate_half(q_y) * sin_y
-            k_y = k_y * cos_y + self._rotate_half(k_y) * sin_y
+        # Concatenate tables to form the full [B, S, D] embedding mask.
+        # This 'cat' is on non-gradient tensors, which is cheap in the backward pass.
+        cos = torch.cat(parts_cos, dim=-1).unsqueeze(1)  # [B, 1, S, D]
+        sin = torch.cat(parts_sin, dim=-1).unsqueeze(1)  # [B, 1, S, D]
 
-        if dz > 0:
-            cos_z = self.cos_z_cache[pos_z].unsqueeze(1)
-            sin_z = self.sin_z_cache[pos_z].unsqueeze(1)
-            q_z = q_z * cos_z + self._rotate_half(q_z) * sin_z
-            k_z = k_z * cos_z + self._rotate_half(k_z) * sin_z
+        # Apply standard RoPE arithmetic on the full tensors.
+        # This keeps q and k contiguous and avoids slicing activations.
+        q_out = (q * cos) + (self._rotate_half(q) * sin)
+        k_out = (k * cos) + (self._rotate_half(k) * sin)
 
-        # Concatenate back, leaving any remaining tail dims (if any) unchanged
-        if s3 < D:
-            q_tail = q[..., s3:]
-            k_tail = k[..., s3:]
-            q = torch.cat([q[..., :s0], q_x, q_y, q_z, q_tail], dim=-1)
-            k = torch.cat([k[..., :s0], k_x, k_y, k_z, k_tail], dim=-1)
-        else:
-            q = torch.cat([q[..., :s0], q_x, q_y, q_z], dim=-1)
-            k = torch.cat([k[..., :s0], k_x, k_y, k_z], dim=-1)
-
-        return q, k
+        return q_out, k_out
