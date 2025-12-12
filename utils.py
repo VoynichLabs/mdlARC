@@ -1,8 +1,11 @@
 import json
 import random
+import math
+import functools
+import itertools
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset, Sampler
@@ -34,6 +37,147 @@ END_TOKEN_ID = TOKEN_TO_ID["<end>"]
 
 MAX_SEQ_LEN = 1863
 IGNORE_INDEX = -100
+
+
+def generate_color_permutations(
+    max_permutations: int, seed: int
+) -> List[Tuple[int, ...]]:
+    """Return up to `max_permutations` unique shuffles of colors 1-9.
+
+    Identity permutation is always included first (index 0 / permutation 1).
+    """
+    if max_permutations <= 0:
+        return []
+    rng = random.Random(seed)
+    digits = list(range(1, 10))
+    identity = tuple(digits)
+    permutations: List[Tuple[int, ...]] = [identity]
+    seen = {identity}
+    limit = math.factorial(9)
+    target = min(max_permutations, limit)
+    if target == 1:
+        return permutations
+
+    if target == limit:
+        # Generate all, shuffle, then force identity to stay first.
+        all_perms = list(itertools.permutations(digits))
+        rng.shuffle(all_perms)
+        deduped = [identity]
+        for perm in all_perms:
+            if perm == identity:
+                continue
+            deduped.append(perm)
+        return deduped[:target]
+
+    while len(permutations) < target:
+        perm = tuple(rng.sample(digits, len(digits)))
+        if perm in seen:
+            continue
+        seen.add(perm)
+        permutations.append(perm)
+    return permutations
+
+
+def color_permutation_to_mapping(perm: Sequence[int]) -> torch.Tensor:
+    """Build a token-id mapping tensor for a specific color permutation."""
+    mapping = torch.arange(VOCAB_SIZE, dtype=torch.long)
+    mapping[1:10] = torch.tensor(list(perm), dtype=torch.long)
+    return mapping
+
+
+def generate_color_mapping_tensors(
+    max_permutations: int, seed: int
+) -> List[torch.Tensor]:
+    perms = generate_color_permutations(max_permutations, seed)
+    return [color_permutation_to_mapping(perm) for perm in perms]
+
+
+def apply_color_permutation_to_tokens(
+    tokens: Sequence[int], mapping: Sequence[int]
+) -> List[int]:
+    """Apply a color permutation mapping to a token list (keeps specials/0 fixed)."""
+    return [int(mapping[tok] if 0 <= tok < len(mapping) else tok) for tok in tokens]
+
+
+def apply_color_permutation_to_grid(
+    grid: Sequence[Sequence[int]], mapping: Sequence[int]
+) -> List[List[int]]:
+    return [
+        [int(mapping[val] if 0 <= val < len(mapping) else val) for val in row]
+        for row in grid
+    ]
+
+
+# In utils.py
+
+
+class ColorAugmentor:
+    """Holds a deterministic list of color mappings and exposes epoch-based selection."""
+
+    def __init__(
+        self,
+        mappings: Sequence[torch.Tensor],
+        apply_to_test_split: bool = False,
+        seed: int = 42,
+    ) -> None:
+        self.mappings = list(mappings)
+        self.apply_to_test_split = apply_to_test_split
+        self.seed = seed
+        self._epoch = 0
+        self._cached_index = 0
+        self._compute_index()  # Initialize for epoch 0
+
+    @property
+    def num_permutations(self) -> int:
+        return len(self.mappings)
+
+    @property
+    def current_index(self) -> int:
+        # O(1) lookup during the hot loop - zero overhead
+        return self._cached_index
+
+    def set_index(self, index: int) -> None:
+        if self.num_permutations == 0:
+            return
+        self._epoch = max(0, int(index))
+        # Compute the randomization only once when the epoch changes
+        self._compute_index()
+
+    def _compute_index(self) -> None:
+        N = self.num_permutations
+        if N == 0:
+            self._cached_index = 0
+            return
+
+        cycle = self._epoch // N
+        step = self._epoch % N
+
+        # 1. First step of any cycle is Identity
+        if step == 0 or N <= 1:
+            self._cached_index = 0
+            return
+
+        # 2. Randomize the remaining steps
+        # We seed the generator with the cycle ID so the order is fixed for this chunk of epochs
+        g = torch.Generator()
+        g.manual_seed(self.seed + cycle)
+
+        # Permute indices [1...N-1]
+        perm = torch.randperm(N - 1, generator=g)
+
+        # Map step 1 -> perm[0], step 2 -> perm[1], etc.
+        random_offset = perm[step - 1].item()
+
+        # +1 because we skipped index 0 (Identity)
+        self._cached_index = random_offset + 1
+
+    def mapping_for_split(self, split: str) -> Optional[torch.Tensor]:
+        if not self.mappings:
+            return None
+        if split == "test" and not self.apply_to_test_split:
+            return None
+        # Uses the cached integer directly
+        return self.mappings[self.current_index]
 
 
 def _value_to_token_id(value: int) -> int:
@@ -388,15 +532,28 @@ def run_aaivr_on_results(
     top_k: int = 2,
     discard_input_copies: bool = True,
     rng: Optional[random.Random] = None,
+    is_dihedral_augmented: bool = False,
+    color_aug_seed: Optional[int] = None,
+    max_color_augments: int = 0,
 ) -> List[AAIVRSelection]:
-    """Aggregate augmented predictions via AAIVR voting.
+    """Aggregate augmented predictions via AAIVR voting. (automated augmentation inverse)
 
-    The function assumes pair_index encodes augmentation order (mod 8). It
-    returns up to `top_k` most common inverse-transformed outputs per
-    original test input.
+    The function assumes pair_index encodes augmentation order (mod 8) if is_dihedral_augmented is True.
+    It now also handles inverting color permutations if color info is provided.
     """
     rng = rng if rng is not None else random
     case_map: Dict[Tuple[str, int], Dict[str, object]] = {}
+
+    # 1. Pre-calculate Inverse Color Mappings
+    inverse_color_mappings: List[List[int]] = []
+    if max_color_augments > 0:
+        seed = color_aug_seed if color_aug_seed is not None else 42
+        forward_tensors = generate_color_mapping_tensors(max_color_augments, seed)
+        for fwd in forward_tensors:
+            # Create inverse: if fwd[x] = y, then inv[y] = x
+            inv = torch.zeros_like(fwd)
+            inv[fwd] = torch.arange(len(fwd), dtype=torch.long)
+            inverse_color_mappings.append(inv.tolist())
 
     for res in results:
         task_id = res.get("task_id")
@@ -404,8 +561,17 @@ def run_aaivr_on_results(
         if task_id is None or pair_index is None:
             continue
 
-        base_pair_index = int(pair_index) // 8
-        transform_index = int(pair_index) % 8
+        if is_dihedral_augmented:
+            # Dataset has 8 copies per pair encoded in index
+            base_pair_index = int(pair_index) // 8
+            transform_index = int(pair_index) % 8
+        else:
+            # Standard dataset: index is just the pair index
+            base_pair_index = int(pair_index)
+            transform_index = 0
+
+        color_idx = res.get("color_permutation_index", 0)
+
         predicted_grid = res.get("output_grid", [])
         prompt_tokens = res.get("prompt_tokens", [])
         input_grids = split_grids_from_tokens(prompt_tokens)
@@ -424,6 +590,26 @@ def run_aaivr_on_results(
         stats = case_map[key]
         stats["generated"] += 1
 
+        # 2. Normalize Target Grid (Geometric Inverse + Color Inverse)
+        target_grid = res.get("target_grid", [])
+        if stats["target_grid"] is None and is_rectangular_grid(target_grid):
+            try:
+                # Geometric Inverse
+                norm_target = apply_inverse_dihedral_transform(
+                    target_grid, transform_index
+                )
+                # Color Inverse
+                if color_idx > 0 and color_idx < len(inverse_color_mappings):
+                    norm_target = apply_color_permutation_to_grid(
+                        norm_target, inverse_color_mappings[color_idx]
+                    )
+
+                if is_rectangular_grid(norm_target):
+                    stats["target_grid"] = norm_target
+            except Exception:
+                pass
+
+        # 3. Validation Checks
         if not is_rectangular_grid(predicted_grid):
             stats["dropped_rect"] += 1
             continue
@@ -431,10 +617,18 @@ def run_aaivr_on_results(
             stats["dropped_input"] += 1
             continue
 
+        # 4. Normalize Predicted Grid (Geometric Inverse + Color Inverse)
         try:
+            # Geometric Inverse
             normalized_grid = apply_inverse_dihedral_transform(
                 predicted_grid, transform_index
             )
+
+            # Color Inverse
+            if color_idx > 0 and color_idx < len(inverse_color_mappings):
+                normalized_grid = apply_color_permutation_to_grid(
+                    normalized_grid, inverse_color_mappings[color_idx]
+                )
         except Exception:
             stats["dropped_rect"] += 1
             continue
@@ -447,13 +641,6 @@ def run_aaivr_on_results(
         grid_key = _grid_to_tuple(normalized_grid)
         counts: Dict[Tuple[Tuple[int, ...], ...], int] = stats["counts"]
         counts[grid_key] = counts.get(grid_key, 0) + 1
-
-        target_grid = res.get("target_grid", [])
-        if stats["target_grid"] is None and is_rectangular_grid(target_grid):
-            normalized_target = apply_inverse_dihedral_transform(
-                target_grid, transform_index
-            )
-            stats["target_grid"] = normalized_target if is_rectangular_grid(normalized_target) else None
 
     selections: List[AAIVRSelection] = []
     for (task_id, base_idx), stats in sorted(case_map.items()):
@@ -490,11 +677,54 @@ def run_aaivr_on_results(
     return selections
 
 
+# In utils.py
+
+
 def summarize_aaivr_pass_at_k(selections: Sequence[AAIVRSelection]) -> Dict[str, int]:
-    """Return counts for how many selections have the target in top-k."""
-    evaluated = [sel for sel in selections if sel.pass_at_k is not None]
-    hits = [sel for sel in evaluated if sel.pass_at_k]
-    return {"evaluated": len(evaluated), "hits": len(hits)}
+    """Return counts for how many tasks have ALL their pairs in top-k."""
+    # Group by task_id
+    tasks: Dict[str, List[AAIVRSelection]] = {}
+    for sel in selections:
+        tasks.setdefault(sel.task_id, []).append(sel)
+
+    total_tasks = len(tasks)
+    solved_tasks = 0
+    failures = []
+
+    for task_id, pairs in tasks.items():
+        # A task is solved if ALL its pairs are solved (pass_at_k is True)
+        is_solved = True
+        pair_failures = []
+
+        for p in pairs:
+            if p.pass_at_k is None:
+                # Target missing or logic failed to find it
+                is_solved = False
+                pair_failures.append(
+                    f"Pair {p.original_pair_index}: Target missing/unknown"
+                )
+            elif not p.pass_at_k:
+                is_solved = False
+                if p.num_valid == 0:
+                    reason = f"No valid candidates generated (tried {p.num_generated})"
+                else:
+                    reason = "Top-k candidates incorrect"
+                pair_failures.append(f"Pair {p.original_pair_index}: {reason}")
+
+        if is_solved and len(pairs) > 0:
+            solved_tasks += 1
+        else:
+            failures.append(f"Task {task_id}: {', '.join(pair_failures)}")
+
+    # Print details as requested
+    if failures:
+        print(f"\nAAIVR Failures ({len(failures)}/{total_tasks} tasks):")
+        for f in failures:
+            print(f"  - {f}")
+
+    # Return structure compatible with 'hits'/'evaluated' expectations
+    # Evaluated now refers to Tasks, Hits to Solved Tasks
+    return {"evaluated": total_tasks, "hits": solved_tasks}
 
 
 DEFAULT_COLORS = [
@@ -753,7 +983,9 @@ class LengthBucketBatchSampler(Sampler[List[int]]):
 
 
 def collate_examples(
-    batch: List[SequenceExample], pad_token_id: int = END_TOKEN_ID
+    batch: List[SequenceExample],
+    pad_token_id: int = END_TOKEN_ID,
+    color_mapper: Optional[Callable[[str], Optional[torch.Tensor]]] = None,
 ) -> Dict[str, torch.Tensor]:
     if not batch:
         raise ValueError("Empty batch encountered during collation.")
@@ -768,7 +1000,12 @@ def collate_examples(
 
     for idx, example in enumerate(batch):
         seq_len = example.seq_len
-        input_ids[idx, :seq_len] = example.tokens
+        tokens = example.tokens
+        if color_mapper is not None:
+            mapping = color_mapper(example.split)
+            if mapping is not None:
+                tokens = mapping[tokens]
+        input_ids[idx, :seq_len] = tokens
         attention_mask[idx, :seq_len] = True
         example_ids[idx] = example.example_id
         positions_3d[idx, :seq_len] = example.cached_positions
@@ -792,6 +1029,7 @@ def create_dataloader(
     shuffle: bool = True,
     num_workers: int = 0,
     bucket_size_multiplier: int = 4,
+    color_mapper: Optional[Callable[[str], Optional[torch.Tensor]]] = None,
 ) -> DataLoader:
     lengths = getattr(dataset, "sequence_lengths", None)
     if lengths is None:
@@ -801,9 +1039,14 @@ def create_dataloader(
     batch_sampler = LengthBucketBatchSampler(
         lengths=lengths, batch_size=batch_size, shuffle=shuffle, bucket_size=bucket_size
     )
+    collate_fn = (
+        functools.partial(collate_examples, color_mapper=color_mapper)
+        if color_mapper is not None
+        else collate_examples
+    )
     return DataLoader(
         dataset,
         batch_sampler=batch_sampler,
         num_workers=num_workers,
-        collate_fn=collate_examples,
+        collate_fn=collate_fn,
     )

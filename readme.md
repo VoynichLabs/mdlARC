@@ -1,6 +1,8 @@
-***In progress, I expect improvements till 30%***
+***Update: 20% right now***
+***(In progress, I expect improvements till 30%)***
 # 10% on ARC-1 for less than a dollar using a 1M transformer
 
+This already beats the pareto frontier btw
 
 ## Self supervised compression on ARC
 
@@ -15,10 +17,10 @@ A self-supervised compression step will obviously perform better:
 For more reasoning behind the approach, read **[My Blog](https://mvakde.github.io/blog/why-all-ARC-solvers-fail-today/)**
 
 ## Details
-Performance - 10% on ARC-1 public eval
+Performance - 10% on ARC-1 public eval  
 Total compute cost - **$0.709**
-- 52m of A100 for training (0.7$)
-- 40s of A100 for inference (0.009$)
+- 52m on A100 for training (0.7$)
+- 40s on A100 for inference (0.009$)
 
 This is early performance. Haven't run all ablations yet
 

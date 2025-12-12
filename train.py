@@ -1,6 +1,7 @@
 import argparse
 from dataclasses import asdict
 import random
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -10,7 +11,14 @@ from torch.optim import AdamW
 import numpy as np
 
 from tinytransformer import TinyTransformer, TinyTransformerConfig
-from utils import ARCExampleDataset, MAX_SEQ_LEN, create_dataloader, tokens_to_string
+from utils import (
+    ARCExampleDataset,
+    MAX_SEQ_LEN,
+    ColorAugmentor,
+    create_dataloader,
+    generate_color_mapping_tensors,
+    tokens_to_string,
+)
 
 DEFAULT_DATA_PATH = Path("assets/ARC-2/grouped-tasks/training/challenges.json")
 
@@ -96,6 +104,27 @@ def _restore_rng_state(state: Optional[Dict[str, Any]], device: torch.device) ->
             pass
 
 
+def _build_color_augmentor(
+    args: argparse.Namespace, is_eval: bool
+) -> Optional[ColorAugmentor]:
+    flag_name = "enable_color_aug_eval" if is_eval else "enable_color_aug_train"
+    max_name = "max_color_augments_eval" if is_eval else "max_color_augments_train"
+    enabled = bool(getattr(args, flag_name, False))
+    max_augments = int(getattr(args, max_name, 0) or 0)
+    if not enabled or max_augments <= 0:
+        return None
+    seed = getattr(args, "color_aug_seed", None)
+    if seed is None:
+        seed = args.seed
+    seed = int(seed)
+    mappings = generate_color_mapping_tensors(max_augments, seed)
+    if not mappings:
+        return None
+    return ColorAugmentor(
+        mappings=mappings, apply_to_test_split=True if is_eval else False, seed=seed
+    )
+
+
 def train_one_epoch(
     model: TinyTransformer,
     dataloader: torch.utils.data.DataLoader,
@@ -106,6 +135,7 @@ def train_one_epoch(
     log_train_strings: bool = False,
     log_train_limit: int = 0,
     log_file: Optional[Path] = None,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
 ) -> int:
     model.train()
     step = start_step
@@ -113,6 +143,12 @@ def train_one_epoch(
     total_input_loss = 0.0
     total_output_loss = 0.0
     logged = 0
+    color_augmentor = getattr(dataloader, "color_augmentor", None)
+    color_aug_in_collate = bool(getattr(dataloader, "color_aug_in_collate", False))
+
+    # Enable BF16 autocast only if on CUDA
+    use_amp = device.type == "cuda"
+
     for batch in dataloader:
         step += 1
         # print(f"DEBUG: Step {step} sequence index: {batch['example_ids'][0].item()}")
@@ -120,22 +156,62 @@ def train_one_epoch(
         attention_mask = batch["attention_mask"].to(device)
         example_ids = batch["example_ids"].to(device)
         positions_3d = batch["positions_3d"].to(device)
+        if (
+            color_augmentor is not None
+            and not color_aug_in_collate
+            and color_augmentor.num_permutations > 0
+        ):
+            splits = batch.get("splits")
+            if splits:
+                # Vectorized color augmentation
+                # 1. Retrieve the active augmentation map for this epoch (V,)
+                aug_map = color_augmentor.mappings[color_augmentor.current_index].to(
+                    device
+                )
+                vocab_size = aug_map.size(0)
 
-        outputs = model(
-            input_ids,
-            example_ids,
-            attention_mask=attention_mask,
-            positions_3d=positions_3d,
-        )
-        loss = outputs["loss"]
-        inp_loss = outputs.get("input_loss")
-        out_loss = outputs.get("output_loss")
+                # 2. Determine which examples in the batch should be augmented
+                # This creates a boolean mask (B, 1) to select maps
+                should_aug = torch.tensor(
+                    [
+                        (color_augmentor.mapping_for_split(s) is not None)
+                        for s in splits
+                    ],
+                    device=device,
+                ).reshape(-1, 1)
+
+                if should_aug.any():
+                    # 3. Construct batch maps (B, V) and gather
+                    # If augment: use aug_map; Else: use identity
+                    identity = torch.arange(vocab_size, device=device)
+                    batch_maps = torch.where(should_aug, aug_map, identity)
+
+                    # Apply map to all tokens: input_ids[b, t] = batch_maps[b, input_ids[b, t]]
+                    input_ids = torch.gather(batch_maps, 1, input_ids)
+
+        # (set_to_none is slightly faster)
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=use_amp
+        ):
+            outputs = model(
+                input_ids,
+                example_ids,
+                attention_mask=attention_mask,
+                positions_3d=positions_3d,
+            )
+            loss = outputs["loss"]
+            inp_loss = outputs.get("input_loss")
+            out_loss = outputs.get("output_loss")
 
         optimizer.zero_grad()
         loss.backward()
         if grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         total_loss += loss.item()
         total_input_loss += inp_loss.item() if inp_loss is not None else 0.0
@@ -166,7 +242,13 @@ def train_one_epoch(
             avg_inp = total_input_loss / 10
             avg_out = total_output_loss / 10
 
-            log_msg = f"step={step} losses: avg={avg_loss:.4f} inp={avg_inp:.4f} out={avg_out:.4f}"
+            current_lr = (
+                scheduler.get_last_lr()[0]
+                if scheduler
+                else optimizer.param_groups[0]["lr"]
+            )
+
+            log_msg = f"step={step} lr={current_lr:.2e} losses: avg={avg_loss:.4f} inp={avg_inp:.4f} out={avg_out:.4f}"
             print(log_msg)
 
             if log_file:
@@ -216,6 +298,7 @@ def maybe_save_model(
     optimizer: Optional[torch.optim.Optimizer] = None,
     global_step: Optional[int] = None,
     rng_state: Optional[Dict[str, Any]] = None,
+    scheduler: Optional[torch.optim.lr_scheduler.LRScheduler] = None,
 ) -> None:
     if save_path is None:
         return
@@ -228,6 +311,8 @@ def maybe_save_model(
     }
     if optimizer is not None:
         checkpoint["optimizer_state"] = optimizer.state_dict()
+    if scheduler is not None:  # <--- SAVE SCHEDULER
+        checkpoint["scheduler_state"] = scheduler.state_dict()
     if global_step is not None:
         checkpoint["global_step"] = int(global_step)
     if rng_state is not None:
@@ -268,6 +353,7 @@ def build_model_and_data(
     args: argparse.Namespace,
     checkpoint: Optional[Dict[str, Any]] = None,
     reuse_dataset: Optional[ARCExampleDataset] = None,
+    is_eval: bool = False,
 ) -> Tuple[
     TinyTransformer, ARCExampleDataset, torch.utils.data.DataLoader, torch.device, Path
 ]:
@@ -311,13 +397,27 @@ def build_model_and_data(
             task_whitelist=task_whitelist,
         )
 
+    color_augmentor = _build_color_augmentor(args, is_eval=is_eval)
+    if color_augmentor is not None:
+        dataset.color_permutation_mappings = color_augmentor.mappings
+        dataset.color_aug_apply_to_test = color_augmentor.apply_to_test_split
+
     # We always recreate the dataloader because batch_size might have changed in args
+    collate_color_mapper = (
+        color_augmentor.mapping_for_split
+        if color_augmentor is not None and getattr(args, "num_workers", 0) == 0
+        else None
+    )
     dataloader = create_dataloader(
         dataset=dataset,
         batch_size=args.batch_size,
         shuffle=not getattr(args, "eval_only", False),
         num_workers=args.num_workers,
+        color_mapper=collate_color_mapper,
     )
+    if color_augmentor is not None:
+        dataloader.color_augmentor = color_augmentor
+        dataloader.color_aug_in_collate = collate_color_mapper is not None
 
     if (
         checkpoint_num_examples is not None
@@ -333,7 +433,19 @@ def build_model_and_data(
         config = TinyTransformerConfig(**checkpoint["config"])
     else:
         num_examples = checkpoint_num_examples or max(1, dataset.num_examples)
-        config = TinyTransformerConfig(num_examples=num_examples)
+        d_model = getattr(args, "d_model", 128)
+        n_heads = getattr(args, "n_heads", 4)
+        d_ff = getattr(args, "d_ff", 512)
+        n_layers = getattr(args, "n_layers", 4)
+        dropout = getattr(args, "dropout", 0.1)
+        config = TinyTransformerConfig(
+            num_examples=num_examples,
+            d_model=d_model,
+            n_heads=n_heads,
+            d_ff=d_ff,
+            n_layers=n_layers,
+            dropout=dropout,
+        )
 
     if dataset.num_examples != config.num_examples:
         raise ValueError(
@@ -413,35 +525,45 @@ def train_model(
     if checkpoint is None:
         checkpoint = getattr(model, "_loaded_checkpoint", None)
 
-    val_batch_size = getattr(args, "val_batch_size", args.batch_size)
-    print(f"Building validation dataloader (batch_size={val_batch_size})...")
+    do_validate = getattr(args, "do_validate", True)
+    val_dataloader = None
 
-    # Create a separate Validation Dataset/Loader that accesses solutions.json
-    # We only include the 'test' split here to calculate validation loss.
-    # STRICT SEPARATION: This is the ONLY place load_test_solutions=True is used.
-    print("Building validation dataloader (reading hidden solutions)...")
-    val_dataset = ARCExampleDataset(
-        json_path=data_path,
-        splits=("test",),  # Only test split for validation
-        include_outputs=True,  # We need outputs to calculate loss
-        load_test_solutions=True,  # <--- Loads solutions.json
-        max_seq_len=MAX_SEQ_LEN,
-        task_whitelist=dataset.task_ids,  # Keep ID mapping consistent
-    )
+    if do_validate:
+        val_batch_size = getattr(args, "val_batch_size", args.batch_size)
+        print(f"Building validation dataloader (batch_size={val_batch_size})...")
 
-    val_dataloader = create_dataloader(
-        dataset=val_dataset,
-        batch_size=val_batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-    )
-    print(f"Validation dataset size: {len(val_dataset)}")
+        # Create a separate Validation Dataset/Loader that accesses solutions.json
+        # We only include the 'test' split here to calculate validation loss.
+        # STRICT SEPARATION: This is the ONLY place load_test_solutions=True is used.
+        print("Building validation dataloader (reading hidden solutions)...")
+        val_dataset = ARCExampleDataset(
+            json_path=data_path,
+            splits=("test",),  # Only test split for validation
+            include_outputs=True,  # We need outputs to calculate loss
+            load_test_solutions=True,  # <--- Loads solutions.json
+            max_seq_len=MAX_SEQ_LEN,
+            task_whitelist=dataset.task_ids,  # Keep ID mapping consistent
+        )
+
+        val_dataloader = create_dataloader(
+            dataset=val_dataset,
+            batch_size=val_batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+        )
+        print(f"Validation dataset size: {len(val_dataset)}")
+    else:
+        print("Validation disabled (skipping solutions.json load).")
 
     # Extract log file from args if it exists
     log_file = getattr(args, "train_log_file", None)
 
     param_groups = _build_weight_decay_param_groups(model, args.weight_decay)
-    optimizer = AdamW(param_groups, lr=args.lr)
+
+    # Fused AdamW is significantly faster on CUDA.
+    use_fused = device.type == "cuda"
+    optimizer = AdamW(param_groups, lr=args.lr, fused=use_fused)
+
     step = int(checkpoint.get("global_step", 0)) if checkpoint else 0
 
     if checkpoint and step > 0:
@@ -458,6 +580,29 @@ def train_model(
 
     # print(f"DEBUG CHECK: Optimizer state size = {len(optimizer.state)} (0 = Fresh/Reset, >0 = Restored)")
 
+    # Linear Warmup (5%) + Cosine Decay
+    total_steps = len(dataloader) * args.epochs
+    warmup_steps = int(total_steps * 0.05)
+
+    def lr_lambda(current_step: int):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        progress = float(current_step - warmup_steps) / float(
+            max(1, total_steps - warmup_steps)
+        )
+        return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # Restore scheduler if resuming
+    if checkpoint and "scheduler_state" in checkpoint:
+        scheduler.load_state_dict(checkpoint["scheduler_state"])
+        print("Restored scheduler state from checkpoint.")
+    elif step > 0:
+        # If we didn't save scheduler state but have steps, fast-forward
+        for _ in range(step):
+            scheduler.step()
+
     # Compile a specific reference for training execution only.
     # We do this AFTER optimizer loading to ensure parameter consistency.
     # We check for CUDA because compile support on MPS/CPU can be flaky or slower.
@@ -467,8 +612,16 @@ def train_model(
     else:
         training_model = model
 
+    color_augmentor = getattr(dataloader, "color_augmentor", None)
+
     for epoch in range(args.epochs):
         print(f"Epoch {epoch + 1}/{args.epochs}")
+        if color_augmentor is not None and color_augmentor.num_permutations > 0:
+            color_augmentor.set_index(epoch)
+            print(
+                f"Using color permutation {color_augmentor.current_index + 1}"
+                f"/{color_augmentor.num_permutations} for this epoch."
+            )
 
         # Run Training
         step = train_one_epoch(
@@ -480,22 +633,26 @@ def train_model(
             start_step=step,
             log_train_strings=args.log_train_strings,
             log_train_limit=args.log_train_limit,
-            log_file=log_file,  # <--- Pass it down
+            log_file=log_file,
+            scheduler=scheduler,
         )
 
         # Run Validation
-        val_loss = validate_one_epoch(
-            model=model,  # Use the base model (not compiled) or compiled one, usually base is safer for eval switch
-            dataloader=val_dataloader,
-            device=device,
-        )
+        if val_dataloader is not None:
+            val_loss = validate_one_epoch(
+                model=model,  # Use the base model (not compiled) or compiled one, usually base is safer for eval switch
+                dataloader=val_dataloader,
+                device=device,
+            )
 
-        val_msg = f"Epoch {epoch + 1} finished. Validation Output Loss: {val_loss:.4f}"
-        print(val_msg)
+            val_msg = (
+                f"Epoch {epoch + 1} finished. Validation Output Loss: {val_loss:.4f}"
+            )
+            print(val_msg)
 
-        if log_file:
-            with open(log_file, "a") as f:
-                f.write(val_msg + "\n")
+            if log_file:
+                with open(log_file, "a") as f:
+                    f.write(val_msg + "\n")
 
     rng_state = _capture_rng_state(device)
     maybe_save_model(
@@ -506,16 +663,5 @@ def train_model(
         optimizer=optimizer,
         global_step=step,
         rng_state=rng_state,
+        scheduler=scheduler,
     )
-
-
-if __name__ == "__main__":
-    import sys
-
-    # Alias this module when executed as a script so cli.py can import it without
-    # triggering a second load under the "train" name.
-    sys.modules.setdefault("train", sys.modules[__name__])
-
-    from cli import main
-
-    main()

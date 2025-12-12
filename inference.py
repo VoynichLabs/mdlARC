@@ -1,7 +1,6 @@
 import json
-import time
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 import torch
 
 from tinytransformer import TinyTransformer
@@ -10,11 +9,11 @@ from utils import (
     IO_SEPARATOR_TOKEN_ID,
     NEXT_LINE_TOKEN_ID,
     START_TOKEN_ID,
+    apply_color_permutation_to_grid,
+    apply_color_permutation_to_tokens,
     compute_positions_3d,
     extract_output_tokens,
     grid_to_tokens,
-    plot_grids,
-    split_grids_from_tokens,
     tokens_to_grid,
     tokens_to_string,
 )
@@ -22,54 +21,242 @@ from utils import (
 DEFAULT_MAX_NEW_TOKENS = 931
 
 
-class BatchGridState:
-    """Vectorized tracker for 3D grid coordinates during generation."""
+# 1. COMPILED HELPER FOR GRID LOGIC
+@torch.compile(mode="default", fullgraph=True)
+def _compiled_grid_update(state, token_ids, start_id, sep_id, end_id, nl_id):
+    x, y, z = state.unbind(-1)
 
+    pos_x = torch.clamp(x, min=0, max=30)
+    pos_y = torch.clamp(y, min=0, max=29)
+    pos_z = z
+
+    is_start = token_ids == start_id
+    is_sep = token_ids == sep_id
+    is_end = token_ids == end_id
+    is_newline = token_ids == nl_id
+
+    zeros = torch.zeros_like(x)
+    pos_x = torch.where(is_start | is_sep | is_end, zeros, pos_x)
+    pos_y = torch.where(is_start | is_sep | is_end, zeros, pos_y)
+    pos_z = torch.where(is_start, zeros, pos_z)
+    pos_z = torch.where(is_sep, torch.full_like(pos_z, 2), pos_z)
+    pos_z = torch.where(is_end, torch.full_like(pos_z, 4), pos_z)
+
+    next_x = x + 1
+    next_y = y
+    next_z = z
+
+    next_x = torch.where(is_newline, zeros, next_x)
+    next_y = torch.where(is_newline, y + 1, next_y)
+    next_x = torch.where(is_sep, zeros, next_x)
+    next_y = torch.where(is_sep, zeros, next_y)
+    next_z = torch.where(is_sep, torch.full_like(next_z, 3), next_z)
+    next_x = torch.where(is_end | is_start, x, next_x)
+    next_y = torch.where(is_end | is_start, y, next_y)
+    next_z = torch.where(is_start, z, next_z)
+    next_z = torch.where(is_end, z, next_z)
+
+    return torch.stack([next_x, next_y, next_z], dim=-1), torch.stack(
+        [pos_x, pos_y, pos_z], dim=-1
+    )
+
+
+class BatchGridState:
     def __init__(self, initial_state: torch.Tensor) -> None:
-        if initial_state.dim() != 2 or initial_state.size(1) != 3:
-            raise ValueError("initial_state must have shape [batch, 3].")
         self.state = initial_state.clone().long()
 
     def update(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Advance state with a batch of token ids and return positions for them."""
         token_ids = token_ids.view(-1).to(device=self.state.device)
-        x, y, z = self.state.unbind(-1)
+        self.state, positions = _compiled_grid_update(
+            self.state,
+            token_ids,
+            START_TOKEN_ID,
+            IO_SEPARATOR_TOKEN_ID,
+            END_TOKEN_ID,
+            NEXT_LINE_TOKEN_ID,
+        )
+        # Clone to break potential cudagraph output reuse between steps
+        self.state = self.state.clone()
+        return positions.clone()
 
-        pos_x = torch.clamp(x, min=0, max=30)
-        pos_y = torch.clamp(y, min=0, max=29)
-        pos_z = z
 
-        is_start = token_ids == START_TOKEN_ID
-        is_sep = token_ids == IO_SEPARATOR_TOKEN_ID
-        is_end = token_ids == END_TOKEN_ID
-        is_newline = token_ids == NEXT_LINE_TOKEN_ID
+@torch.inference_mode()
+def batched_greedy_generate(
+    model, prompts, example_ids, device, max_new_tokens=931, cached_positions=None
+):
+    model.eval()
+    model.to(dtype=torch.bfloat16)
 
-        zeros = torch.zeros_like(x)
-        pos_x = torch.where(is_start | is_sep | is_end, zeros, pos_x)
-        pos_y = torch.where(is_start | is_sep | is_end, zeros, pos_y)
-        pos_z = torch.where(is_start, zeros, pos_z)
-        pos_z = torch.where(is_sep, torch.full_like(pos_z, 2), pos_z)
-        pos_z = torch.where(is_end, torch.full_like(pos_z, 4), pos_z)
+    batch_size = len(prompts)
 
-        next_x = x + 1
-        next_y = y
-        next_z = z
+    # --- Setup Inputs ---
+    example_ids_tensor = torch.tensor(example_ids, dtype=torch.long, device=device)
+    # _left_pad_sequences and _pad_cached_positions from your original code...
+    # Assuming they are available in scope or imported
+    input_ids, attention_mask = _left_pad_sequences(prompts, END_TOKEN_ID, device)
 
-        next_x = torch.where(is_newline, zeros, next_x)
-        next_y = torch.where(is_newline, y + 1, next_y)
+    # --- 2. Calculate DYNAMIC Buffer Size ---
+    current_len = input_ids.size(1)
 
-        next_x = torch.where(is_sep, zeros, next_x)
-        next_y = torch.where(is_sep, zeros, next_y)
-        next_z = torch.where(is_sep, torch.full_like(next_z, 3), next_z)
+    # We only need space for the prompt + new tokens
+    batch_max_needed = current_len + max_new_tokens
 
-        next_x = torch.where(is_end | is_start, x, next_x)
-        next_y = torch.where(is_end | is_start, y, next_y)
-        next_z = torch.where(is_start, z, next_z)
-        next_z = torch.where(is_end, z, next_z)
+    # OPTIONAL: Round up to nearest 64 to reduce torch.compile recompilation frequency
+    batch_max_needed = (batch_max_needed + 127) // 128 * 128
 
-        self.state = torch.stack([next_x, next_y, next_z], dim=-1)
-        positions = torch.stack([pos_x, pos_y, pos_z], dim=-1)
-        return positions
+    # Clamp to model capacity
+    max_model_len = min(batch_max_needed, model.config.max_seq_len)
+
+    # Pre-calculate 3D positions for prompt
+    if cached_positions and all(p is not None for p in cached_positions):
+        prompt_positions = _pad_cached_positions(
+            [p for p in cached_positions if p is not None], input_ids.size(1), device
+        )
+    else:
+        prompt_positions = compute_positions_3d(input_ids, attention_mask).to(
+            device=device, dtype=torch.long
+        )
+
+    # Calculate initial grid state
+    from inference import _derive_initial_state_from_prompt  # Import or paste logic
+
+    initial_state, finished = _derive_initial_state_from_prompt(
+        input_ids, prompt_positions, attention_mask
+    )
+    grid_state = BatchGridState(initial_state)
+
+    example_embeds = model.example_embedding(example_ids_tensor).to(
+        dtype=torch.bfloat16
+    )
+    current_len = input_ids.size(1)
+
+    # --- 1. PROMPT PASS (Fill Cache) ---
+    # We create a FULL SIZED mask: [B, MaxLen]
+    # We set future positions to False
+    full_attention_mask = torch.zeros(
+        (batch_size, max_model_len), dtype=torch.bool, device=device
+    )
+    full_attention_mask[:, :current_len] = attention_mask
+
+    # Prompt pass uses the sliced view for computation, but returns KV cache we will size up
+    outputs = model.forward_generate(
+        input_ids=input_ids,
+        example_ids=example_ids_tensor,
+        past_key_values=None,
+        positions_3d=prompt_positions,
+        attention_mask=attention_mask,  # Prompt pass uses tight mask
+        example_embeds=example_embeds,
+    )
+    logits = outputs["logits"]
+    prompt_kvs = outputs["past_key_values"]
+
+    # We need a static [B, MaxLen] mask for the compiled graph.
+    full_attention_mask = torch.zeros(
+        (batch_size, max_model_len), dtype=torch.bool, device=device
+    )
+    # Copy the prompt mask into the static buffer
+    full_attention_mask[:, :current_len] = attention_mask
+
+    # --- 2. SETUP STATIC KV CACHE ---
+    # Convert the prompt KVs into a fixed size buffer [B, H, MaxLen, D]
+    past_key_values = []
+    for k, v in prompt_kvs:
+        # k, v are [B, H, PromptLen, D]
+        B, H, L, D = k.shape
+        # Create full-sized buffer
+        k_buf = torch.zeros(
+            (B, H, max_model_len, D), dtype=torch.bfloat16, device=device
+        )
+        v_buf = torch.zeros(
+            (B, H, max_model_len, D), dtype=torch.bfloat16, device=device
+        )
+        # Copy prompt history into buffer
+        k_buf[:, :, :L, :] = k
+        v_buf[:, :, :L, :] = v
+        past_key_values.append((k_buf, v_buf))
+    past_key_values = tuple(past_key_values)
+
+    # --- 3. COMPILE GENERATION STEP ---
+    # We compile the forward pass specifically for the decoding step
+    if not hasattr(model, "_compiled_decode"):
+        print("Compiling model for decoding step...")
+        model._compiled_decode = torch.compile(
+            model.forward_generate, mode="default", fullgraph=True
+        )
+
+    # --- 4. GENERATION LOOP ---
+    cache_position = torch.tensor([current_len], dtype=torch.long, device=device)
+    steps_remaining = min(max_new_tokens, max_model_len - current_len)
+
+    # Output buffer
+    generated_tokens_buffer = torch.full(
+        (batch_size, steps_remaining), END_TOKEN_ID, dtype=torch.long, device=device
+    )
+
+    # Loop over steps
+    # We use a Python loop, but the heavy lifting is inside the compiled regions
+    for step_i in range(steps_remaining):
+        if finished.all():
+            break
+
+        # Mark a new cudagraph step to avoid reusing outputs as inputs
+        torch.compiler.cudagraph_mark_step_begin()
+
+        # Greedy decode
+        next_token = torch.argmax(logits[:, -1, :], dim=-1)
+        next_token = torch.where(
+            finished, torch.tensor(END_TOKEN_ID, device=device), next_token
+        )
+
+        # Save token
+        generated_tokens_buffer[:, step_i] = next_token
+
+        # Update finished status
+        finished = finished | (next_token == END_TOKEN_ID)
+
+        # Update Grid (Compiled)
+        token_positions = grid_state.update(next_token).unsqueeze(1)
+
+        # Update Mask (In-place on the full buffer)
+        # Note: In static graph world, we pass the WHOLE mask.
+        # We update the mask bit for the current position.
+        full_attention_mask.index_fill_(1, cache_position, True)
+        # However, we must ensure we handle finished sequences.
+        # Actually, if we just keep attending to padding (END tokens), it's fine for shape consistency.
+        # Ideally, we mask out finished ones, but for batching we usually just let them generate padding.
+        # Specifically: The mask must be True for the *new* token index.
+        # Since we use index_fill with a scalar tensor, it sets that column to True for ALL batch items.
+        # This is acceptable for simple batching; masking finished rows is handled by "finished" logic.
+
+        # Run Model (Compiled)
+        # Note: We pass the FULL STATIC mask. No slicing.
+        # We pass the cache_position as a TENSOR.
+        outputs = model._compiled_decode(
+            input_ids=next_token.unsqueeze(1),
+            example_ids=example_ids_tensor,
+            past_key_values=past_key_values,  # Passing the fixed buffers
+            positions_3d=token_positions,
+            attention_mask=full_attention_mask,  # Full [B, MaxLen]
+            cache_position=cache_position,  # Tensor(1)
+            example_embeds=example_embeds,
+        )
+        logits = outputs["logits"]
+
+        # Increment position
+        cache_position.add_(1)
+
+    # --- 5. FINALIZE ---
+    # (Existing code to convert buffer to lists)
+    generated_cpu = generated_tokens_buffer.tolist()
+    results = []
+    for i, prompt in enumerate(prompts):
+        gen_seq = []
+        for token in generated_cpu[i]:
+            gen_seq.append(token)
+            if token == END_TOKEN_ID:
+                break
+        results.append(list(prompt) + gen_seq)
+    return results
 
 
 def _left_pad_sequences(
@@ -148,147 +335,6 @@ def _derive_initial_state_from_prompt(
     return initial_state, finished
 
 
-@torch.no_grad()
-def batched_greedy_generate(
-    model: TinyTransformer,
-    prompts: Sequence[Sequence[int]],
-    example_ids: Sequence[int],
-    device: torch.device,
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
-    cached_positions: Optional[Sequence[Optional[torch.Tensor]]] = None,
-) -> List[List[int]]:
-    if not prompts:
-        raise ValueError("prompts must be non-empty.")
-    if len(prompts) != len(example_ids):
-        raise ValueError("prompts and example_ids must have the same length.")
-    if cached_positions is not None and len(cached_positions) != len(prompts):
-        raise ValueError(
-            "cached_positions must be None or match the number of prompts."
-        )
-
-    model.eval()
-    batch_size = len(prompts)
-    max_prompt_len = max(len(seq) for seq in prompts)
-    if max_prompt_len > model.config.max_seq_len:
-        raise ValueError("Prompt length exceeds model max_seq_len; cannot generate.")
-
-    example_ids_tensor = torch.tensor(example_ids, dtype=torch.long, device=device)
-    input_ids, attention_mask = _left_pad_sequences(
-        prompts, pad_token_id=END_TOKEN_ID, device=device
-    )
-
-    use_cached_positions = cached_positions is not None and all(
-        pos is not None for pos in cached_positions
-    )
-
-    if use_cached_positions:
-        prompt_positions = _pad_cached_positions(
-            [pos for pos in cached_positions if pos is not None],
-            max_prompt_len,
-            device=device,
-        )
-    else:
-        prompt_positions = compute_positions_3d(input_ids, attention_mask).to(
-            device=device, dtype=torch.long
-        )
-
-    initial_state, finished = _derive_initial_state_from_prompt(
-        input_ids, prompt_positions, attention_mask
-    )
-    grid_state = BatchGridState(initial_state)
-
-    # 1. Initial Prompt Pass
-    running_attention_mask = attention_mask.clone()
-    outputs = model.forward_generate(
-        input_ids=input_ids,
-        example_ids=example_ids_tensor,
-        past_key_values=None,
-        positions_3d=prompt_positions,
-        attention_mask=running_attention_mask,
-    )
-    logits = outputs["logits"]
-    prompt_past_key_values = outputs["past_key_values"]
-
-    # 2. Pre-allocate KV Cache
-    # We create a buffer of (Batch, Heads, MaxSeqLen, Dim) and copy the prompt KV into it.
-    max_len = model.config.max_seq_len
-    past_key_values: List[Tuple[torch.Tensor, torch.Tensor]] = []
-
-    current_len = input_ids.size(1)
-
-    for k, v in prompt_past_key_values:
-        # k, v are [Batch, Heads, PromptLen, Dim]
-        # create buffer
-        B, H, L, D = k.shape
-        k_buffer = torch.zeros((B, H, max_len, D), dtype=k.dtype, device=k.device)
-        v_buffer = torch.zeros((B, H, max_len, D), dtype=v.dtype, device=v.device)
-
-        # Copy prompt data
-        k_buffer[:, :, :L, :] = k
-        v_buffer[:, :, :L, :] = v
-        past_key_values.append((k_buffer, v_buffer))
-
-    past_key_values = tuple(past_key_values)
-    cache_position = current_len  # We start generating at this index
-
-    max_steps_allowed = max(model.config.max_seq_len - input_ids.size(1), 0)
-    steps_remaining = min(max_new_tokens, max_steps_allowed)
-
-    # Instead of appending to python lists (CPU) every step, we write to this tensor.
-    generated_tokens_buffer = torch.full(
-        (batch_size, steps_remaining), END_TOKEN_ID, dtype=torch.long, device=device
-    )
-
-    if steps_remaining <= 0 or finished.all():
-        return [list(seq) for seq in prompts]
-
-    steps = 0
-    while steps < steps_remaining and not finished.all():
-        next_token = torch.argmax(logits[:, -1, :], dim=-1)
-        next_token = torch.where(
-            finished, torch.full_like(next_token, END_TOKEN_ID), next_token
-        )
-
-        should_append = ~finished
-        token_positions = grid_state.update(next_token).unsqueeze(1)
-
-        # Write to GPU buffer directly. No .item(), no .tolist(), no CPU sync.
-        generated_tokens_buffer[:, steps] = next_token
-
-        finished = finished | (next_token == END_TOKEN_ID)
-
-        step_mask = should_append.unsqueeze(1)
-        running_attention_mask = torch.cat([running_attention_mask, step_mask], dim=1)
-
-        outputs = model.forward_generate(
-            input_ids=next_token.unsqueeze(1),
-            example_ids=example_ids_tensor,
-            past_key_values=past_key_values,
-            positions_3d=token_positions,
-            attention_mask=running_attention_mask,
-            cache_position=cache_position,
-        )
-        logits = outputs["logits"]
-        # past_key_values = outputs["past_key_values"]
-
-        steps += 1
-        cache_position += 1
-
-    generated_cpu = generated_tokens_buffer[:, :steps].tolist()
-
-    results = []
-    for i, prompt in enumerate(prompts):
-        gen_seq = []
-        # Extract valid tokens until the first END_TOKEN_ID
-        for token in generated_cpu[i]:
-            gen_seq.append(token)
-            if token == END_TOKEN_ID:
-                break
-        results.append(list(prompt) + gen_seq)
-
-    return results
-
-
 def _build_prompt_from_tokens(tokens: Sequence[int]) -> List[int]:
     if IO_SEPARATOR_TOKEN_ID not in tokens:
         raise ValueError("Prompt sequence is missing <input_output_separator>.")
@@ -300,6 +346,8 @@ def _prepare_examples_for_inference(
     examples: Sequence[object],
     include_targets: bool = False,
     solutions: Optional[Dict[Tuple[str, int], List[List[int]]]] = None,
+    color_mappings: Optional[Sequence[Optional[Sequence[int]]]] = None,
+    color_apply_fn: Optional[Callable[[str], bool]] = None,
 ) -> Tuple[
     List[List[int]],
     List[int],
@@ -313,10 +361,23 @@ def _prepare_examples_for_inference(
     cached_positions: List[Optional[torch.Tensor]] = []
     target_tokens: List[List[int]] = []
 
-    for ex in examples:
+    for idx, ex in enumerate(examples):
         if not hasattr(ex, "tokens"):
             raise ValueError("Examples must provide a 'tokens' attribute.")
-        tokens = ex.tokens.tolist()
+        raw_tokens = ex.tokens.tolist()
+        split = getattr(ex, "split", None)
+
+        # Select the specific mapping for this example
+        mapping = color_mappings[idx] if color_mappings is not None else None
+
+        should_color = mapping is not None and (
+            color_apply_fn is None or color_apply_fn(split)
+        )
+        tokens = (
+            apply_color_permutation_to_tokens(raw_tokens, mapping)
+            if should_color
+            else raw_tokens
+        )
         prompt_tokens = _build_prompt_from_tokens(tokens)
         prompts.append(prompt_tokens)
         example_ids.append(int(getattr(ex, "example_id", 0)))
@@ -332,7 +393,10 @@ def _prepare_examples_for_inference(
         elif include_targets and solutions is not None:
             key = (getattr(ex, "task_id", None), getattr(ex, "pair_index", None))
             if key in solutions and solutions[key] is not None:
-                targets = grid_to_tokens(solutions[key])
+                target_grid = solutions[key]
+                if should_color:
+                    target_grid = apply_color_permutation_to_grid(target_grid, mapping)
+                targets = grid_to_tokens(target_grid)
         target_tokens.append(targets)
         metadata.append(
             {
@@ -403,100 +467,6 @@ def _run_generation_batch(
     )
 
 
-def _select_inference_examples(
-    dataset,
-    task_ids: Sequence[str],
-    split: str = "test",
-    pair_index: Optional[int] = 0,
-    require_outputs: bool = False,
-    solutions: Optional[Dict[Tuple[str, int], List[List[int]]]] = None,
-) -> Tuple[
-    List[List[int]],
-    List[int],
-    List[Dict[str, object]],
-    List[Optional[torch.Tensor]],
-    List[List[int]],
-]:
-    selected = []
-    for task_id in task_ids:
-        candidate = None
-        for example in dataset.iter_examples(split=split):
-            if example.task_id != task_id:
-                continue
-            if pair_index is not None and example.pair_index != pair_index:
-                continue
-            has_solution = solutions is not None and (
-                (example.task_id, example.pair_index) in solutions
-            )
-            if require_outputs and not example.has_output and not has_solution:
-                continue
-            candidate = example
-            break
-        if candidate is None:
-            raise ValueError(
-                f"No {split} example found for task_id={task_id} pair_index={pair_index}."
-            )
-        selected.append(candidate)
-
-    prompts, example_ids, metadata, cached_positions, targets = (
-        _prepare_examples_for_inference(
-            selected, include_targets=require_outputs, solutions=solutions
-        )
-    )
-    return prompts, example_ids, metadata, cached_positions, targets
-
-
-@torch.no_grad()
-def run_batched_inference(
-    model: TinyTransformer,
-    dataset,
-    task_ids: Sequence[str],
-    device: torch.device,
-    split: str = "test",
-    pair_index: int = 0,
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
-    log_prompts: bool = False,
-    include_targets: bool = False,
-) -> List[Dict[str, object]]:
-    solutions = _load_solutions_for_dataset(dataset) if include_targets else None
-    (prompts, example_ids, metadata, cached_positions, target_output_tokens) = (
-        _select_inference_examples(
-            dataset,
-            task_ids,
-            split=split,
-            pair_index=pair_index,
-            require_outputs=include_targets,
-            solutions=solutions,
-        )
-    )
-    if log_prompts:
-        for meta, prompt in zip(metadata, prompts):
-            print(
-                "[prompt]",
-                f"task={meta['task_id']}",
-                f"pair={meta['pair_index']}",
-                "::",
-                tokens_to_string(prompt),
-            )
-
-    sequences = batched_greedy_generate(
-        model=model,
-        prompts=prompts,
-        example_ids=example_ids,
-        device=device,
-        max_new_tokens=max_new_tokens,
-        cached_positions=cached_positions,
-    )
-    return _build_generation_results(
-        sequences=sequences,
-        metadata=metadata,
-        prompts=prompts,
-        target_output_tokens=target_output_tokens
-        if include_targets
-        else [[] for _ in prompts],
-    )
-
-
 def _load_solutions_for_dataset(dataset) -> Dict[Tuple[str, int], List[List[int]]]:
     """Load solutions.json located next to the dataset (used only for evaluation).
 
@@ -546,7 +516,7 @@ def _gather_examples_for_split(
     return examples
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def run_split_inference(
     model: TinyTransformer,
     dataset,
@@ -558,6 +528,8 @@ def run_split_inference(
     pair_index: Optional[int] = None,
     log_prompts: bool = False,
     include_targets: bool = True,
+    color_mappings: Optional[Sequence[Sequence[int]]] = None,
+    color_apply_fn: Optional[Callable[[str], bool]] = None,
 ) -> List[Dict[str, object]]:
     solutions = _load_solutions_for_dataset(dataset) if include_targets else None
     examples = _gather_examples_for_split(
@@ -571,12 +543,37 @@ def run_split_inference(
     if not examples:
         return []
 
-    results: List[Dict[str, object]] = []
-    for start in range(0, len(examples), batch_size):
-        batch_examples = examples[start : start + batch_size]
+    color_variants: List[Optional[Sequence[int]]] = (
+        list(color_mappings) if color_mappings is not None else [None]
+    )
+
+    # Flatten the workload: Create a job for every (Example, ColorMapping) pair
+    work_items = []
+    for c_idx, mapping in enumerate(color_variants):
+        for ex in examples:
+            work_items.append((ex, c_idx, mapping))
+
+    # Sort ALL work items by sequence length (descending) to minimize padding.
+    # Note: Color permutation maps digits 1-to-1, so ex.seq_len is invariant.
+    work_items.sort(key=lambda item: item[0].seq_len, reverse=True)
+
+    all_results: List[Dict[str, object]] = []
+
+    for start in range(0, len(work_items), batch_size):
+        chunk = work_items[start : start + batch_size]
+
+        # Unzip the batch components
+        batch_examples = [item[0] for item in chunk]
+        batch_c_indices = [item[1] for item in chunk]
+        batch_mappings = [item[2] for item in chunk]
+
         (prompts, example_ids, metadata, cached_positions, target_output_tokens) = (
             _prepare_examples_for_inference(
-                batch_examples, include_targets=include_targets, solutions=solutions
+                batch_examples,
+                include_targets=include_targets,
+                solutions=solutions,
+                color_mappings=batch_mappings,  # Pass the batch-specific mappings
+                color_apply_fn=color_apply_fn,
             )
         )
         if log_prompts:
@@ -599,8 +596,18 @@ def run_split_inference(
             max_new_tokens=max_new_tokens,
             target_output_tokens=target_output_tokens if include_targets else None,
         )
-        results.extend(batch_results)
-    return results
+
+        print(
+            f"[{split}] Finished batch {start // batch_size + 1} / {(len(work_items) + batch_size - 1) // batch_size}"
+        )
+
+        # Attach the correct color index to each result and collect
+        for res, c_idx in zip(batch_results, batch_c_indices):
+            if color_mappings is not None:
+                res["color_permutation_index"] = c_idx
+            all_results.append(res)
+
+    return all_results
 
 
 def _has_correct_shape(
@@ -682,6 +689,9 @@ def evaluate_model_on_dataset(
     batch_size: int = 16,
     splits: Sequence[str] = ("train", "test"),
     log_prompts: bool = False,
+    color_mappings: Optional[Sequence[Sequence[int]]] = None,
+    color_apply_fn: Optional[Callable[[str], bool]] = None,
+    task_ids: Optional[Sequence[str]] = None,
 ) -> Dict[str, Dict[str, object]]:
     evaluation: Dict[str, Dict[str, object]] = {}
     for split in splits:
@@ -694,156 +704,10 @@ def evaluate_model_on_dataset(
             max_new_tokens=max_new_tokens,
             log_prompts=log_prompts,
             include_targets=True,
+            color_mappings=color_mappings,
+            color_apply_fn=color_apply_fn,
+            task_ids=task_ids,
         )
         summary = summarize_split_results(split_results)
         evaluation[split] = {"results": split_results, "summary": summary}
     return evaluation
-
-
-def run_inference(
-    model: TinyTransformer,
-    dataset,
-    task_id: str,
-    pair_index: int,
-    device: torch.device,
-    split: str = "test",
-    log_prompt: bool = False,
-    plot_grids_flag: bool = False,
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
-) -> None:
-    start_time = time.perf_counter()
-    results = run_batched_inference(
-        model=model,
-        dataset=dataset,
-        task_ids=[task_id],
-        device=device,
-        split=split,
-        pair_index=pair_index,
-        max_new_tokens=max_new_tokens,
-        log_prompts=log_prompt,
-    )
-    if not results:
-        print("No inference results were produced.")
-        return
-
-    result = results[0]
-    full_sequence = result["sequence"]
-    output_tokens = result["output_tokens"]
-    predicted_grid = result["output_grid"]
-    elapsed = time.perf_counter() - start_time
-
-    print(f"\nInference results for task {task_id} pair {pair_index} ({split} split)")
-    print(
-        f"Generation time: {elapsed:.3f}s for "
-        f"{len(full_sequence) - len(result.get('prompt_tokens', []))} new tokens "
-        f"(total length {len(full_sequence)})"
-    )
-    print("Generated raw (string):", tokens_to_string(full_sequence))
-    print("Generated (string):", tokens_to_string(output_tokens))
-    if predicted_grid:
-        print("Decoded grid:")
-        for row in predicted_grid:
-            print(row)
-    else:
-        print("Decoded grid: <empty>")
-
-    if plot_grids_flag:
-        try:
-            prompt_tokens = result.get("prompt_tokens", [])
-            prompt_grids = split_grids_from_tokens(prompt_tokens)
-            gen_grids = split_grids_from_tokens(
-                [*prompt_tokens, *output_tokens, END_TOKEN_ID]
-            )
-            input_grid = prompt_grids[0] if prompt_grids else []
-            output_grid = (
-                gen_grids[1] if len(gen_grids) > 1 else tokens_to_grid(output_tokens)
-            )
-            to_plot = [input_grid, output_grid]
-            plot_grids(to_plot, title=f"task {task_id} pair {pair_index}")
-        except Exception as e:
-            print(f"Plotting failed: {e}")
-
-
-@torch.no_grad()
-def greedy_generate(
-    model: TinyTransformer,
-    prompt_tokens: torch.LongTensor,
-    example_id: int,
-    device: torch.device,
-    cached_positions: Optional[torch.LongTensor] = None,
-    log_time: bool = False,
-) -> torch.LongTensor:
-    prompts = [prompt_tokens.tolist()]
-    cached = [cached_positions] if cached_positions is not None else None
-    start_time = time.perf_counter() if log_time else None
-
-    sequences = batched_greedy_generate(
-        model=model,
-        prompts=prompts,
-        example_ids=[example_id],
-        device=device,
-        cached_positions=cached,
-    )
-
-    if start_time is not None:
-        elapsed = time.perf_counter() - start_time
-        print(
-            f"Generation time: {elapsed:.3f}s for "
-            f"{len(sequences[0]) - len(prompts[0])} new tokens"
-        )
-
-    return torch.tensor(sequences[0], dtype=torch.long)
-
-
-def group_eval_sequences_by_task(
-    evaluation: Dict[str, Dict[str, object]],
-) -> Dict[str, Dict[str, List[List[int]]]]:
-    """
-    Restructures evaluation results into a format optimized for export:
-    {
-      "split_name": {
-        "task_id": [ <sequence_pair_0>, <sequence_pair_1>, ... ]
-      }
-    }
-    """
-    output = {}
-    for split, split_data in evaluation.items():
-        results = split_data.get("results", [])
-
-        # 1. Group by task_id -> pair_index -> sequence
-        # We use a dict first to handle potential out-of-order processing
-        task_map: Dict[str, Dict[int, List[int]]] = {}
-
-        for res in results:
-            task_id = res.get("task_id")
-            pair_index = res.get("pair_index")
-            sequence = res.get("sequence")
-
-            # Basic validation
-            if task_id is None or pair_index is None or sequence is None:
-                continue
-
-            if task_id not in task_map:
-                task_map[task_id] = {}
-            task_map[task_id][pair_index] = sequence
-
-        # 2. Convert pair-maps to sorted lists
-        output[split] = {}
-        for task_id, pairs_dict in task_map.items():
-            if not pairs_dict:
-                output[split][task_id] = []
-                continue
-
-            # Determine list size based on the highest pair index found
-            max_idx = max(pairs_dict.keys())
-
-            # Pre-fill with empty lists to handle potential non-contiguous indices safely
-            # (Though ARC data is usually contiguous 0..N)
-            seq_list = [[] for _ in range(max_idx + 1)]
-
-            for idx, seq in pairs_dict.items():
-                seq_list[idx] = seq
-
-            output[split][task_id] = seq_list
-
-    return output
